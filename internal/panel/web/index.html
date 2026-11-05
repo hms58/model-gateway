@@ -1,0 +1,1748 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>model-gateway 控制台</title>
+  <style>
+    /* ---------- 设计变量 ---------- */
+    :root {
+      --ink: #14171c;
+      --ink-2: #39424e;
+      --muted: #66707d;
+      --line: #e2e7ee;
+      --line-soft: #eef1f5;
+      --paper: #f2f4f7;
+      --surface: #ffffff;
+      --accent: #2a46c8;
+      --accent-soft: #eef1fd;
+      --ok: #0e7c66;
+      --ok-soft: #e7f5f1;
+      --warn: #a9631a;
+      --warn-soft: #fdf3e4;
+      --err: #b42318;
+      --err-soft: #fdeceb;
+      --radius: 10px;
+      --radius-sm: 6px;
+      --sans: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      --mono: "Cascadia Mono", ui-monospace, "Consolas", monospace;
+      --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 2px 6px rgba(16, 24, 40, .05);
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--ink);
+      background: var(--paper);
+      -webkit-font-smoothing: antialiased;
+    }
+    h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -.015em; }
+    a { color: var(--accent); }
+    code, .mono { font-family: var(--mono); font-size: .92em; }
+    .muted { color: var(--muted); font-size: 12px; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+    /* ---------- 外壳：侧栏 + 内容 ---------- */
+    .shell { display: flex; min-height: 100vh; }
+    .side {
+      flex: 0 0 232px;
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+      padding: 22px 16px 18px;
+      background: var(--surface);
+      border-right: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      height: 100vh;
+    }
+    .brand { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
+    .brand b { font-size: 17px; letter-spacing: -.02em; }
+    .brand span { font-size: 12px; color: var(--muted); }
+    .side nav { display: flex; flex-direction: column; gap: 2px; }
+    .side nav a {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 10px;
+      border-radius: var(--radius-sm);
+      color: var(--ink-2);
+      text-decoration: none;
+      font-size: 13.5px;
+    }
+    .side nav a::before {
+      content: "";
+      width: 3px;
+      height: 16px;
+      border-radius: 2px;
+      background: transparent;
+    }
+    .side nav a:hover { background: var(--line-soft); color: var(--ink); }
+    .side nav a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+    .side nav a.active::before { background: var(--accent); }
+    .side .foot { margin-top: auto; padding: 0 8px; color: var(--muted); font-size: 11.5px; line-height: 1.7; }
+    .side .foot .mono { color: var(--ink-2); }
+
+    .main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+    header#topbar {
+      display: flex;
+      align-items: flex-end;
+      gap: 16px;
+      padding: 22px 28px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    .titles { min-width: 0; }
+    .titles h1 { font-size: 20px; }
+    .titles p { margin: 2px 0 0; font-size: 12.5px; color: var(--muted); }
+    header#topbar .spacer { margin-left: auto; }
+    .version {
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--ink-2);
+      background: var(--line-soft);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 9px;
+      white-space: nowrap;
+    }
+    main { padding: 22px 28px 96px; max-width: 1280px; width: 100%; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    /* ---------- 控件 ---------- */
+    button {
+      font: inherit;
+      font-size: 13px;
+      min-height: 34px;
+      padding: 6px 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+      transition: background .12s ease, border-color .12s ease;
+    }
+    button:hover { border-color: #cdd5df; background: #fbfcfd; }
+    button.primary { background: var(--ink); border-color: var(--ink); color: #fff; }
+    button.primary:hover { background: #24292f; border-color: #24292f; }
+    button.danger { color: var(--err); }
+    button.danger:hover { background: var(--err-soft); border-color: #f3c9c5; }
+    button:disabled { opacity: .5; cursor: default; }
+    input, select {
+      font: inherit;
+      font-size: 13px;
+      min-height: 34px;
+      padding: 6px 9px;
+      color: var(--ink);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+    }
+    input::placeholder { color: #9aa4b1; }
+
+    .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+    .bar > label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+    .bar .grow { margin-left: auto; }
+
+    /* ---------- 表格 ---------- */
+    .table-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+    th, td { padding: 11px 14px; text-align: left; font-size: 13px; vertical-align: middle; }
+    thead th {
+      font-weight: 600;
+      font-size: 12px;
+      color: var(--muted);
+      background: #fafbfc;
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+    }
+    tbody td { border-bottom: 1px solid var(--line-soft); }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { background: #fcfdfe; }
+    td.rail { width: 4px; padding: 0; border-left: 3px solid transparent; }
+    tr.ok td.rail { border-left-color: var(--ok); }
+    tr.warn td.rail { border-left-color: var(--warn); }
+    tr.err td.rail { border-left-color: var(--err); }
+    td.actions { white-space: nowrap; }
+    td.actions button { margin-right: 4px; }
+    td.actions button:last-child { margin-right: 0; }
+    .id { font-family: var(--mono); font-size: 12.5px; }
+    .num { font-variant-numeric: tabular-nums; }
+
+    /* ---------- 标签与链 ---------- */
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 1px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #f8fafc;
+      color: var(--ink-2);
+      font-size: 11.5px;
+      white-space: nowrap;
+    }
+    .chip.ok { color: var(--ok); background: var(--ok-soft); border-color: #c6e8df; }
+    .chip.warn { color: var(--warn); background: var(--warn-soft); border-color: #f3ddba; }
+    .chip.err { color: var(--err); background: var(--err-soft); border-color: #f5cdc9; }
+    .chip b { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .chain { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+    .chain .arrow { color: #b3bcc7; font-size: 12px; }
+
+    /* ---------- 产品 / Token 单元格 ---------- */
+    .cell-id { display: flex; flex-direction: column; gap: 1px; }
+    .cell-id small { color: var(--muted); font-size: 11.5px; }
+    .health { display: flex; flex-direction: column; gap: 3px; }
+    .health .when { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+
+    /* ---------- 模型组：左右布局 ---------- */
+    .split { display: flex; gap: 14px; align-items: flex-start; }
+    .split-left {
+      flex: 0 0 268px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .split-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .split-head strong { font-size: 13px; }
+    .glist { max-height: calc(100vh - 240px); overflow: auto; }
+    .gitem { padding: 11px 14px; border-bottom: 1px solid var(--line-soft); cursor: pointer; position: relative; }
+    .gitem:last-child { border-bottom: 0; }
+    .gitem:hover { background: #fbfcfd; }
+    .gitem.active { background: var(--accent-soft); }
+    .gitem.active::before {
+      content: "";
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      width: 3px;
+      background: var(--accent);
+    }
+    .gitem .name { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; font-size: 13.5px; }
+    .gitem .sub { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+    .gitem .sub .mono { color: var(--ink-2); }
+
+    .split-right {
+      flex: 1 1 auto;
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 18px 18px 76px;
+    }
+    .editor-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+    .editor-head h3 { font-size: 16px; }
+    .editor-head .hint { margin-left: auto; font-size: 12px; color: var(--muted); }
+    .editor-head .hint code { color: var(--ink-2); }
+    .field-grid { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+    .field-grid > label { flex: 1 1 200px; display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
+    .section-line {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 18px 0 10px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line-soft);
+    }
+    .section-line strong { font-size: 13px; }
+    .section-line .grow { margin-left: auto; }
+
+    /* 成员行：两段式（主行 + 参数行），窄容器和移动端都不会挤 */
+    .member-list { display: flex; flex-direction: column; gap: 8px; }
+    .member-row {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      background: var(--surface);
+    }
+    .member-row:hover { border-color: #cfd8e3; }
+    .member-row.dragging { opacity: .45; }
+    .member-row.drop-target { border-color: var(--accent); box-shadow: inset 0 2px 0 var(--accent); }
+    .drag {
+      cursor: grab;
+      color: #aab4c0;
+      font-size: 15px;
+      line-height: 1;
+      user-select: none;
+      padding: 2px 3px;
+    }
+    .drag:active { cursor: grabbing; }
+    .m-main { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .m-main .idx { min-width: 16px; }
+    .m-main label { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; white-space: nowrap; }
+    .m-main select { width: 128px; flex: 0 0 auto; }
+    .m-main .me-model { flex: 0 1 340px; min-width: 160px; }
+    .m-sub {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--line-soft);
+    }
+    .m-sub label { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); }
+    .chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; white-space: nowrap; }
+    .m-sub input { min-height: 30px; padding: 4px 8px; font-size: 12px; }
+    .m-sub .me-weight { width: 78px; }
+    .m-sub .me-start, .m-sub .me-end { width: 208px; font-family: var(--mono); font-size: 11.5px; }
+    .m-sub .m-act { margin-left: auto; display: inline-flex; gap: 4px; }
+    .m-sub .window-inputs { display: inline-flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .m-sub .window-inputs[hidden] { display: none; }
+    /* 已添加的成员：产品/模型只读，避免改出「同一成员换身份」的歧义 */
+    .member-row .me-product:disabled,
+    .member-row .me-model[readonly] {
+      background: #f5f7fa;
+      color: var(--ink-2);
+      cursor: not-allowed;
+    }
+    .m-sub .hint-inline { font-size: 11.5px; color: #9aa4b1; }
+    .search { min-height: 32px; width: 100%; }
+    /* 工具栏里的搜索框不要拉满整行（那是给添加成员选择器用的） */
+    .bar .search { width: auto; flex: 0 1 260px; }
+    /* 配置页：分组卡片 */
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 14px;
+      padding: 0 16px 16px;
+    }
+    .card-box {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+    }
+    .card-box h3 { font-size: 13px; margin-bottom: 10px; }
+    .card-box label { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; color: var(--muted); margin-bottom: 10px; }
+    .card-box input[type=text], .card-box input[type=number] { min-height: 32px; }
+    .card-box label.inline { flex-direction: row; align-items: center; gap: 8px; color: var(--ink); font-size: 12.5px; }
+    /* 模型列表：产品分组标题行 */
+    .group-head td { background: #f7f8fb; font-weight: 600; font-size: 12px; }
+
+    /* 运行状态：独立整宽列表，与编辑器 / 添加成员面板分开 */
+    .status-box {
+      margin-top: 18px;
+      padding: 14px 16px 16px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+    .status-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    .status-head h3 { font-size: 14px; }
+    .status-head .muted { flex: 1 1 auto; font-size: 12px; }
+    .status-box td { font-size: 12.5px; vertical-align: middle; }
+    .status-box td .mono { font-size: 11.5px; color: var(--ink-2); }
+    .status-box .empty { border: 0; }
+
+    /* 添加成员：搜索 + 候选列表 + 按钮，固定在成员列表下方 */
+    .m-add { margin-top: 14px; border: 1px dashed var(--line); border-radius: var(--radius); padding: 12px; background: #fbfcfd; }
+    .m-add-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    .m-add-head strong { font-size: 12.5px; }
+    .m-add-row { display: flex; gap: 8px; align-items: stretch; flex-wrap: wrap; }
+    .m-add-row .search { flex: 1 1 220px; width: auto; }
+    .m-add-row #ge-cands { flex: 2 1 320px; min-height: 96px; font-family: var(--mono); font-size: 12px; }
+    .m-add-row .m-add-act { display: flex; flex-direction: column; gap: 6px; justify-content: flex-start; }
+    .m-add-row .m-add-act button { white-space: nowrap; }
+    .lay {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 34px;
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--line);
+      background: #fafbfc;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--ink-2);
+    }
+    .idx { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+    .icon-btn { min-width: 32px; min-height: 30px; padding: 2px 8px; }
+    .sticky-save {
+      position: sticky;
+      bottom: 0;
+      display: flex;
+      gap: 8px;
+      margin-top: 16px;
+      padding: 12px 0 0;
+      background: linear-gradient(180deg, rgba(255,255,255,.6), #fff 40%);
+      border-top: 1px solid var(--line);
+    }
+
+    /* ---------- 抽屉 ---------- */
+    .drawer { position: fixed; inset: 0; background: rgba(20, 23, 28, .34); display: none; z-index: 30; }
+    .drawer.show { display: block; }
+    .drawer .body {
+      position: absolute;
+      right: 0; top: 0; bottom: 0;
+      width: min(520px, 100%);
+      background: var(--surface);
+      padding: 20px;
+      overflow: auto;
+      box-shadow: var(--shadow);
+    }
+    .drawer h3 { font-size: 16px; margin-bottom: 14px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    .row > label { flex: 1 1 170px; display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
+    .member { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; margin-bottom: 10px; }
+
+    /* ---------- 提示 ---------- */
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      max-width: min(420px, 90vw);
+      padding: 11px 15px;
+      border-radius: var(--radius);
+      background: var(--ink);
+      color: #fff;
+      font-size: 13px;
+      box-shadow: var(--shadow);
+      display: none;
+      z-index: 40;
+    }
+    .toast.show { display: block; }
+    .empty {
+      padding: 28px 16px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+      border: 1px dashed var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+    .empty b { display: block; color: var(--ink); font-size: 13.5px; margin-bottom: 4px; }
+
+    /* 登录对话框（不使用系统自带 prompt） */
+    .modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background: rgba(20, 23, 28, .42);
+      z-index: 50;
+    }
+    .modal.show { display: flex; }
+    .modal-card {
+      width: min(380px, 100%);
+      background: var(--surface);
+      border-radius: var(--radius);
+      padding: 22px;
+      box-shadow: 0 12px 36px rgba(16, 24, 40, .2);
+    }
+    .modal-card h3 { font-size: 16px; margin-bottom: 6px; }
+    .modal-card p { margin: 0 0 14px; font-size: 12.5px; color: var(--muted); }
+    .modal-card input { width: 100%; }
+    .modal-card .err { color: var(--err); font-size: 12px; margin: 8px 0 0; }
+    .modal-act { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+    /* ---------- 移动端 ---------- */
+    @media (max-width: 900px) {
+      .shell { flex-direction: column; }
+      .side {
+        flex: 0 0 auto;
+        height: auto;
+        flex-direction: row;
+        align-items: center;
+        gap: 14px;
+        padding: 12px 14px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+        overflow-x: auto;
+        z-index: 10;
+      }
+      .brand { padding: 0; white-space: nowrap; }
+      .brand span { display: none; }
+      .side nav { flex-direction: row; gap: 6px; }
+      .side nav a { padding: 7px 12px; min-height: 38px; white-space: nowrap; }
+      .side nav a::before { display: none; }
+      .side nav a.active { background: var(--ink); color: #fff; }
+      .side .foot { display: none; }
+
+      header#topbar { padding: 14px 14px 10px; align-items: center; position: static; }
+      .titles h1 { font-size: 17px; }
+      .titles p { display: none; }
+      main { padding: 14px 14px 88px; }
+
+      .split { flex-direction: column; }
+      .split-left { flex: 1 1 auto; width: 100%; }
+      .glist { max-height: none; }
+      .split-right { padding: 14px 14px 76px; }
+      .editor-head .hint { display: none; }
+      .section-line { flex-wrap: wrap; }
+      .section-line strong { flex: 0 0 auto; }
+      .section-line > .muted { flex: 1 1 100%; order: 3; }
+      .section-line .grow { white-space: nowrap; }
+      .m-main .me-model { flex: 1 1 100%; }
+      .m-sub { gap: 8px; }
+      .m-sub label { flex: 0 0 auto; }
+      .m-sub .me-start, .m-sub .me-end { width: 100%; min-width: 0; }
+      .m-sub .m-act { margin-left: auto; }
+      .m-add-row .search { flex: 1 1 100%; }
+      .m-add-row #ge-cands { flex: 1 1 100%; min-height: 120px; }
+      .m-add-row .m-add-act { flex: 1 1 100%; flex-direction: row; }
+      .m-add-row .m-add-act button { flex: 1 1 0; }
+
+      /* 表格转卡片 */
+      .table-wrap { overflow-x: visible; }
+      table, thead, tbody, th, td, tr { display: block; }
+      thead { display: none; }
+      table { border: 0; background: transparent; }
+      tbody { display: flex; flex-direction: column; gap: 10px; }
+      tr.card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 10px 14px;
+      }
+      tr.card td { border: 0; padding: 3px 0; display: flex; gap: 10px; align-items: baseline; }
+      tr.card td::before { content: attr(data-label); flex: 0 0 66px; color: var(--muted); font-size: 11.5px; }
+      tr.card td.rail { display: none; }
+      tr.card td.actions { flex-wrap: wrap; padding-top: 8px; }
+      tr.card td.actions::before { content: ""; flex: 0 0 0; }
+      tr.card td.actions button { margin: 3px 4px 0 0; }
+      .sticky-save {
+        position: sticky;
+        bottom: 0;
+        margin: 14px -14px -76px;
+        padding: 12px 14px;
+        background: rgba(255, 255, 255, .96);
+        backdrop-filter: blur(6px);
+        z-index: 6;
+      }
+      .bar { gap: 8px; }
+      .bar .grow { margin-left: 0; width: 100%; }
+      .bar .search { flex: 1 1 100%; width: 100%; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="side">
+      <div class="brand"><b>model-gateway</b><span>多产品模型网关</span></div>
+      <nav>
+        <a href="/panel/products" data-view="products">产品</a>
+        <a href="/panel/groups" data-view="groups">模型组</a>
+        <a href="/panel/models" data-view="models">模型</a>
+        <a href="/panel/logs" data-view="logs">请求日志</a>
+        <a href="/panel/tokens" data-view="tokens">Token</a>
+        <a href="/panel/settings" data-view="settings">配置</a>
+      </nav>
+      <div class="foot">
+        OpenAI 兼容入口<br><span class="mono">/v1/chat/completions</span>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header id="topbar">
+        <div class="titles">
+          <h1 id="page-title">产品</h1>
+          <p id="page-sub">下游 *2api 实例在这里登记，模型组按产品挑成员。</p>
+        </div>
+        <span class="spacer"></span>
+        <span class="version" id="version">config version -</span>
+        <button id="logout" type="button">退出</button>
+      </header>
+
+      <main>
+        <section class="panel" id="products">
+          <div class="bar">
+            <button class="primary" id="product-new" type="button">新增产品</button>
+            <span class="muted">删除前需先解除模型组引用</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th></th><th>产品</th><th>协议</th><th>地址</th><th>状态</th><th>健康</th><th>操作</th></tr></thead>
+              <tbody id="products-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" id="groups">
+          <div class="split">
+            <aside class="split-left">
+              <div class="split-head">
+                <strong>模型组</strong>
+                <button class="primary" id="group-new" type="button">新建</button>
+              </div>
+              <div class="glist" id="groups-list"></div>
+            </aside>
+            <div class="split-right" id="group-editor">
+              <div class="empty"><b>还没有选中模型组</b>从左侧选择一个组，或点「新建」。</div>
+            </div>
+          </div>
+
+          <!-- 运行状态：独立于编辑器的整宽列表，不占编辑器空间 -->
+          <section class="status-box" id="group-status-box">
+            <div class="status-head">
+              <h3>运行状态</h3>
+              '<span class="muted" id="group-status-note">选中模型组后显示启用成员的可用性；嗅探会真实请求一次模型（max_tokens=1）</span>'
+              <button id="ge-status-refresh" type="button">刷新</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th></th><th>模型</th><th>产品</th><th>状态</th><th>原因</th><th>解除</th><th>最近成功</th><th>最近嗅探</th><th>操作</th></tr></thead>
+                <tbody id="ge-status"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section class="panel" id="models">
+          <div class="bar">
+            <select id="model-product" aria-label="按产品过滤"><option value="">全部产品</option></select>
+            <input class="search" id="model-q" placeholder="搜索模型">
+            <button id="model-refresh" class="primary" type="button">刷新（回源）</button>
+            <span class="spacer"></span>
+            <span class="muted" id="model-note">缓存 10 分钟内直接读文件，过期或缺文件才回源</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th></th><th>模型</th><th>产品</th><th>更新时间</th><th>状态</th></tr></thead>
+              <tbody id="models-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" id="logs">
+          <div class="bar">
+            <label>从 <input type="date" id="log-from"></label>
+            <label>到 <input type="date" id="log-to"></label>
+            <select id="log-outcome">
+              <option value="">全部结果</option>
+              <option value="ok">ok</option>
+              <option value="client_error">client_error</option>
+              <option value="quota">quota</option>
+              <option value="upstream">upstream</option>
+              <option value="product_auth">product_auth</option>
+              <option value="mid_stream">mid_stream</option>
+              <option value="downgraded">仅降级</option>
+            </select>
+            <button id="log-refresh" type="button">查询</button>
+            <span class="muted grow" id="log-summary"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th></th><th>时间</th><th>Token</th><th>模型组</th><th>命中成员</th><th>状态</th><th>结果</th><th>耗时</th><th>尝试链路</th></tr></thead>
+              <tbody id="logs-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" id="tokens">
+          <div class="bar">
+            <button class="primary" id="token-new" type="button">新建 Token</button>
+            <span class="muted">完整 key 仅创建时展示一次</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th></th><th>名称</th><th>前缀</th><th>允许的组</th><th>状态</th><th>创建时间</th><th>使用</th><th>操作</th></tr></thead>
+              <tbody id="tokens-body"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel" id="settings">
+          <div class="bar">
+            <strong>通用配置</strong>
+            <span class="muted">选路 / 探活 / 日志即时生效；启动参数（监听、数据目录、管理口令）下次启动生效</span>
+            <span class="spacer"></span>
+            <button id="settings-save" class="primary" type="button">保存</button>
+          </div>
+          <div class="cards">
+            <div class="card-box">
+              <h3>启动参数 <span class="muted" style="font-size:11.5px">重启后生效</span></h3>
+              <label>监听地址（host:port）<input type="text" id="set-listen" placeholder=":8080"></label>
+              <label>数据目录<input type="text" id="set-data-dir" placeholder="./data"></label>
+              <label>管理口令<input type="password" id="set-admin-token" autocomplete="new-password" placeholder="留空表示不修改"></label>
+              <p class="muted" style="font-size:11.5px" id="set-admin-hint">只保存 SHA-256，明文不入库；改完需重启，重启后用新口令登录。</p>
+            </div>
+            <div class="card-box">
+              <h3>选路与熔断</h3>
+              <label>最大尝试次数<input type="number" id="set-attempts" min="1" max="10"></label>
+              <label>冷却基数（如 2s）<input type="text" id="set-cd-base"></label>
+              <label>冷却上限（如 60s）<input type="text" id="set-cd-max"></label>
+              <label>熔断阈值（连续失败次数）<input type="number" id="set-cd-threshold" min="0"></label>
+              <label>熔断时长（如 5m）<input type="text" id="set-cd-open"></label>
+              <label class="inline"><input type="checkbox" id="set-prefer"> 优先上次成功的成员</label>
+              <label class="inline"><input type="checkbox" id="set-sticky"> 开启会话粘性</label>
+              <label>粘性 TTL（如 10m）<input type="text" id="set-sticky-ttl"></label>
+            </div>
+            <div class="card-box">
+              <h3>异步探活</h3>
+              <label class="inline"><input type="checkbox" id="set-probe"> 开启后台探活</label>
+              <label>扫描间隔（如 60s，最小 5s）<input type="text" id="set-probe-interval"></label>
+              <label>同产品最小间隔（如 30s）<input type="text" id="set-probe-min-gap"></label>
+              <p class="muted" style="font-size:11.5px">探活对单个成员真实发一次 chat（max_tokens=1）；是否参与由模型组里每个成员自己的「异步嗅探」开关决定。</p>
+            </div>
+            <div class="card-box">
+              <h3>日志</h3>
+              <label>日志目录<input type="text" id="set-log-dir"></label>
+              <label>保留天数（≥1）<input type="number" id="set-log-retention" min="1"></label>
+              <label>单文件上限（MB）<input type="number" id="set-log-maxmb" min="1"></label>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+
+  <div class="drawer" id="drawer"><div class="body" id="drawer-body"></div></div>
+  <div class="toast" id="toast"></div>
+
+  <div class="modal" id="login-modal">
+    <form class="modal-card" id="login-form">
+      <h3>登录控制台</h3>
+      <p>输入管理口令。凭据只存在本机浏览器，不回显明文。</p>
+      <input type="password" id="login-token" autocomplete="off" placeholder="管理口令">
+      <p class="err" id="login-error" hidden></p>
+      <div class="modal-act"><button type="submit" class="primary">进入</button></div>
+    </form>
+  </div>
+
+  <script>
+    const ADMIN_KEY = 'modelgw_admin';
+    const params = new URLSearchParams(location.search);
+    const embed = params.get('embed') === '1';
+    if (params.get('token')) localStorage.setItem(ADMIN_KEY, params.get('token'));
+    if (embed) {
+      document.getElementById('topbar').style.display = 'none';
+      document.querySelector('.side').style.display = 'none';
+    }
+
+    let version = 0;
+    let products = [];
+    let groups = [];
+    let tokenRows = [];
+    // bootstrapMode：服务端尚未设置管理口令（仅本机可访问），此时不弹登录框。
+    let bootstrapMode = false;
+    const modelCache = {};
+
+    function token() { return localStorage.getItem(ADMIN_KEY) || ''; }
+    function toast(message) {
+      const box = document.getElementById('toast');
+      box.textContent = message;
+      box.classList.add('show');
+      clearTimeout(toast.timer);
+      toast.timer = setTimeout(() => box.classList.remove('show'), 2600);
+    }
+    async function api(path, options) {
+      const init = options || {};
+      init.headers = Object.assign({ 'Content-Type': 'application/json' }, init.headers || {});
+      if (token()) init.headers.Authorization = 'Bearer ' + token();
+      const response = await fetch('/api/modelgw' + path, init);
+      const text = await response.text();
+      const payload = text ? JSON.parse(text) : {};
+      if (response.status === 401) {
+        // 服务端已说明原因（初始化模式只允许本机 / 口令无效），直接透传，不再编造文案。
+        const message = (payload.error && payload.error.message) || '凭据无效，请重新输入';
+        if (!bootstrapMode) showLogin(message);
+        throw new Error(message);
+      }
+      if (!response.ok) {
+        const message = (payload.error && payload.error.message) || ('HTTP ' + response.status);
+        if (payload.error && payload.error.code === 20607) { toast('配置已被他人修改，正在刷新'); await loadVersion(); }
+        throw new Error(message);
+      }
+      if (typeof payload.version === 'number') version = payload.version;
+      return payload;
+    }
+    function showLogin(message) {
+      const modal = document.getElementById('login-modal');
+      const input = document.getElementById('login-token');
+      const box = document.getElementById('login-error');
+      box.textContent = message || '';
+      box.hidden = !message;
+      modal.classList.add('show');
+      input.value = '';
+      setTimeout(() => input.focus(), 30);
+    }
+    function hideLogin() { document.getElementById('login-modal').classList.remove('show'); }
+
+    document.getElementById('login-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const value = document.getElementById('login-token').value.trim();
+      if (!value) return;
+      localStorage.setItem(ADMIN_KEY, value);
+      try {
+        const payload = await api('/config/version');
+        hideLogin();
+        document.getElementById('version').textContent = 'config v' + payload.version;
+        route();
+      } catch (err) {
+        const box = document.getElementById('login-error');
+        box.textContent = '凭据无效，请重新输入';
+        box.hidden = false;
+      }
+    });
+    document.getElementById('logout').onclick = () => {
+      // 初始化模式下没有登录态可退，直接跳到「启动参数」引导设口令。
+      if (bootstrapMode) {
+        history.replaceState({}, '', '/panel/settings');
+        route();
+        const node = document.getElementById('set-admin-token');
+        if (node) { node.focus(); toast('在这里填管理口令并保存，重启后生效'); }
+        return;
+      }
+      localStorage.removeItem(ADMIN_KEY);
+      showLogin();
+    };
+
+    async function loadVersion() {
+      try { version = (await api('/config/version')).version; document.getElementById('version').textContent = 'config v' + version; }
+      catch (_) { /* 未登录时忽略 */ }
+    }
+
+    function esc(value) {
+      return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function cell(label, value) { return '<td data-label="' + label + '">' + value + '</td>'; }
+    function rail() { return '<td class="rail"></td>'; }
+    function chip(text, cls, title) {
+      return '<span class="chip ' + (cls || '') + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + text + '</span>';
+    }
+    function healthText(health) {
+      if (!health || (!health.last_ok_at && !health.last_error)) return '<span class="muted">尚无请求</span>';
+      const ok = health.last_ok_at
+        ? '<span class="when">' + esc(health.last_ok_at) + '</span>'
+        : '<span class="muted">未成功过</span>';
+      const bad = health.last_error
+        ? '<span class="muted">最近错误 ' + esc(health.last_error) + '</span>'
+        : '';
+      return '<div class="health">' + ok + bad + '</div>';
+    }
+    function outcomeClass(outcome) {
+      if (outcome === 'ok') return 'ok';
+      if (outcome === 'upstream' || outcome === 'product_auth' || outcome === 'no_member') return 'err';
+      if (outcome) return 'warn';
+      return '';
+    }
+    // 一次请求的尝试链路：产品 + 状态码，鼠标悬停看结果分类与耗时。
+    function attemptChain(attempts) {
+      if (!attempts || !attempts.length) return '<span class="muted">-</span>';
+      return '<span class="chain">' + attempts.map((a, index) => {
+        const cls = a.status >= 200 && a.status < 300 ? 'ok' : (a.status === 0 ? 'err' : 'warn');
+        return (index ? '<span class="arrow">›</span>' : '') +
+          chip(esc(a.product) + ' <b>' + esc(a.status || '×') + '</b>', cls, (a.code || '') + ' ' + (a.ms || 0) + 'ms');
+      }).join('') + '</span>';
+    }
+
+    // ---------- 产品 ----------
+    async function loadProducts() {
+      const payload = await api('/products');
+      products = payload.data || [];
+      document.getElementById('products-body').innerHTML = products.map(p => {
+        const bad = p.health && p.health.last_error;
+        return '<tr class="card ' + (p.enabled ? (bad ? 'warn' : 'ok') : '') + '">' +
+          rail() +
+          cell('产品', '<div class="cell-id"><span class="id">' + esc(p.id) + '</span><small>' + esc(p.name || '未命名') + '</small></div>') +
+          cell('协议', chip(esc(p.protocol || 'openai-chat'))) +
+          cell('地址', '<span class="mono">' + esc(p.base_url) + '</span>') +
+          cell('状态', p.enabled ? chip('启用', 'ok') : chip('停用')) +
+          cell('健康', healthText(p.health)) +
+          cell('操作', '<button data-act="edit-product" data-id="' + esc(p.id) + '">编辑</button>' +
+            '<button data-act="toggle-product" data-id="' + esc(p.id) + '" data-on="' + (p.enabled ? '0' : '1') + '">' + (p.enabled ? '停用' : '启用') + '</button>' +
+            '<button data-act="models" data-id="' + esc(p.id) + '">拉取模型</button>' +
+            '<button data-act="test-product" data-id="' + esc(p.id) + '">测试连通</button>' +
+            '<button class="danger" data-act="del-product" data-id="' + esc(p.id) + '">删除</button>') +
+          '</tr>';
+      }).join('') || '<tr class="card"><td colspan="7"><div class="empty"><b>还没有产品</b>先登记一个下游实例，再建模型组。</div></td></tr>';
+    }
+
+    function productForm(product) {
+      const p = product || { protocol: 'openai-chat', enabled: true, timeout: { connect: '5s', first_byte: '30s', total: '300s' } };
+      return '<h3>' + (product ? '编辑产品' : '新增产品') + '</h3>' +
+        '<div class="row"><label>ID<input id="f-id" value="' + esc(p.id) + '"' + (product ? ' disabled' : '') + '></label>' +
+        '<label>名称<input id="f-name" value="' + esc(p.name) + '"></label></div>' +
+        '<div class="row"><label>协议<input id="f-protocol" value="' + esc(p.protocol || 'openai-chat') + '"></label>' +
+        '<label>启用<select id="f-enabled"><option value="1"' + (p.enabled ? ' selected' : '') + '>是</option><option value="0"' + (p.enabled ? '' : ' selected') + '>否</option></select></label></div>' +
+        '<div class="row"><label>base_url<input id="f-base" value="' + esc(p.base_url) + '"></label></div>' +
+        '<div class="row"><label>api_key<input id="f-key" type="password" autocomplete="new-password" value="' + esc(p.api_key) + '"></label></div>' +
+        '<p class="muted">列表只回掩码；留空或保持掩码表示不修改。</p>' +
+        '<div class="row"><label>connect<input id="f-connect" value="' + esc((p.timeout || {}).connect || '5s') + '"></label>' +
+        '<label>first_byte<input id="f-first" value="' + esc((p.timeout || {}).first_byte || '30s') + '"></label>' +
+        '<label>total<input id="f-total" value="' + esc((p.timeout || {}).total || '300s') + '"></label></div>' +
+        '<div class="sticky-save"><button class="primary" id="f-save" type="button">保存</button><button id="f-cancel" type="button">取消</button></div>';
+    }
+
+    function openProduct(id) {
+      const product = id ? products.find(item => item.id === id) : null;
+      showDrawer(productForm(product), () => {
+        const data = {
+          id: document.getElementById('f-id').value.trim(),
+          name: document.getElementById('f-name').value.trim(),
+          protocol: document.getElementById('f-protocol').value.trim() || 'openai-chat',
+          enabled: document.getElementById('f-enabled').value === '1',
+          base_url: document.getElementById('f-base').value.trim(),
+          api_key: document.getElementById('f-key').value.trim(),
+          timeout: {
+            connect: document.getElementById('f-connect').value.trim() || '5s',
+            first_byte: document.getElementById('f-first').value.trim() || '30s',
+            total: document.getElementById('f-total').value.trim() || '300s',
+          },
+        };
+        if (!data.id) { toast('ID 不能为空'); return; }
+        api('/products', { method: 'POST', body: JSON.stringify({ version, product: data }) })
+          .then(() => { closeDrawer(); toast('已保存'); loadProducts(); })
+          .catch(err => toast(err.message));
+      });
+    }
+
+    // ---------- 模型组（左右布局） ----------
+    let editingGroup = null;   // null=未选中；''=新建；其他=已选组名
+    let draft = null;          // 编辑器里的草稿，保存前不落盘
+
+    function groupSorted(g) {
+      // 权重即优先级：降序即降级顺序，同权重保持列表原顺序。
+      return (g.members || []).slice().sort((a, b) => (Number(b.weight) || 0) - (Number(a.weight) || 0));
+    }
+
+    // 存储格式是 "YYYY-MM-DD HH:MM:SS"，datetime-local 要 "YYYY-MM-DDTHH:MM:SS"。
+    function toLocalValue(raw) { return (raw || '').replace(' ', 'T'); }
+    function fromLocalValue(value) {
+      const text = (value || '').replace('T', ' ').trim();
+      // 浏览器可能把 00:00:00 归一化成 00:00，落盘前统一补齐到秒。
+      return /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(text) ? text + ':00' : text;
+    }
+    // 开启限时时给个「当天生效」的默认区间：00:00:00 ~ 23:59:59。
+    function todayDefault(kind) {
+      const now = new Date();
+      const pad = n => String(n).padStart(2, '0');
+      const date = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate());
+      return date + (kind === 'start' ? 'T00:00:00' : 'T23:59:59');
+    }
+
+    function memberTag(m) {
+      if (!m.enabled) return ['停用', ''];
+      const parse = raw => {
+        const text = (raw || '').trim();
+        if (!text) return null;
+        const ms = Date.parse(text.replace(' ', 'T') + (text.length === 19 ? '+08:00' : ''));
+        return Number.isNaN(ms) ? null : ms;
+      };
+      const start = parse(m.effective && m.effective.start);
+      const end = parse(m.effective && m.effective.end);
+      if (start && Date.now() < start) return ['未到生效', 'warn'];
+      if (end && Date.now() > end) return ['已过期', 'warn'];
+      return ['可用', 'ok'];
+    }
+
+    async function loadGroups() {
+      // 成员产品下拉依赖产品列表；从其它页签直接进来时这里补一次。
+      if (!products.length) {
+        try { products = (await api('/products')).data || []; } catch (_) { /* 失败时下拉为空，不影响查看 */ }
+      }
+      const payload = await api('/model-groups');
+      groups = payload.data || [];
+      if (editingGroup && !groups.some(g => g.name === editingGroup)) { editingGroup = null; draft = null; }
+      renderGroupList();
+      renderGroupEditor();
+    }
+
+    function renderGroupList() {
+      const list = document.getElementById('groups-list');
+      list.innerHTML = groups.map(g => {
+        const members = groupSorted(g);
+        const summary = members.slice(0, 2).map(m => '<span class="mono">' + esc(m.product + '/' + m.model) + '</span>').join('<br>') || '无成员';
+        return '<div class="gitem' + (g.name === editingGroup ? ' active' : '') + '" data-act="select-group" data-name="' + esc(g.name) + '">' +
+          '<div class="name"><span>' + esc(g.name) + '</span>' + (g.enabled ? chip('启用', 'ok') : chip('停用')) + '</div>' +
+          '<div class="sub">' + summary + '</div>' +
+          '<div class="sub">' + members.length + ' 个成员 · ' + members.filter(m => m.enabled).length + ' 启用</div>' +
+          '</div>';
+      }).join('') || '<div class="empty" style="border:0;border-radius:0"><b>还没有模型组</b>点上方「新建」起一个。</div>';
+    }
+
+    function newMember(productId, modelName) {
+      const weights = (draft && draft.members ? draft.members : []).map(m => Number(m.weight) || 0);
+      return {
+        product: productId || (products[0] || {}).id || '',
+        model: modelName || '',
+        weight: weights.length ? Math.max(10, Math.min.apply(null, weights) - 10) : 100,
+        enabled: true, effective: { start: '', end: '' },
+      };
+    }
+
+    // 添加成员的候选池：把每个产品已拉取到的模型摊平成 (产品, 模型) 列表。
+    function catalogEntries() {
+      const entries = [];
+      products.forEach(product => {
+        (modelCache[product.id] || []).forEach(model => entries.push({ product: product.id, model }));
+      });
+      return entries;
+    }
+
+    function renderAddCandidates() {
+      const select = document.getElementById('ge-cands');
+      if (!select) return;
+      const query = document.getElementById('ge-add-q');
+      const keyword = ((query && query.value) || '').trim().toLowerCase();
+      const catalog = catalogEntries();
+      // 已在组内的成员不再出现在候选里；搜索也只搜「还能加的」。
+      const members = (draft && draft.members) || [];
+      const available = catalog.filter(item => !members.some(
+        member => member.product === item.product && member.model === item.model));
+      const entries = available.filter(item => !keyword || (item.product + '/' + item.model).toLowerCase().includes(keyword));
+      select.innerHTML = entries.map(item =>
+        '<option value="' + esc(item.product + '|' + item.model) + '">' + esc(item.product + ' · ' + item.model) + '</option>').join('');
+      const hint = document.getElementById('ge-add-hint');
+      if (hint) {
+        if (!catalog.length) hint.textContent = '模型目录还没拉到，可先用「手工填一个」';
+        else if (!available.length) hint.textContent = '该组已包含全部模型';
+        else if (!entries.length) hint.textContent = '没有匹配的模型（已添加的不会再出现）';
+        else hint.textContent = entries.length + ' / ' + available.length + ' 个可添加';
+      }
+    }
+
+    function productSelect(selected) {
+      return products.map(p => '<option value="' + esc(p.id) + '"' + (p.id === selected ? ' selected' : '') + '>' + esc(p.id) + '</option>').join('');
+    }
+
+    function memberRowHtml(m, index) {
+      const tag = memberTag(m);
+      const effective = m.effective || {};
+      const limited = !!(effective.start || effective.end);
+      // 已存在（保存过 / 从配置读出来的）成员：产品与模型锁定，只能改权重、启用与时段。
+      const locked = m.__saved === true;
+      const lockHint = locked ? ' title="已添加的成员不可改产品/模型，需要更换请删除后重新添加"' : '';
+      return '<div class="member-row" data-index="' + index + '" draggable="true">' +
+        '<div class="m-main">' +
+          '<span class="drag" title="拖动调整顺序">⠿</span>' +
+          '<span class="idx">' + (index + 1) + '</span>' +
+          '<span class="chk muted"><input type="checkbox" class="me-enabled"' + (m.enabled ? ' checked' : '') + '> 启用</span>' +
+          '<select class="me-product"' + (locked ? ' disabled' : '') + lockHint + '>' + productSelect(m.product) + '</select>' +
+          '<input class="me-model" list="models-' + esc(m.product) + '" value="' + esc(m.model) + '" placeholder="模型名（可直接手填）"' + (locked ? ' readonly' : '') + lockHint + '>' +
+          chip(esc(tag[0]), tag[1]) +
+        '</div>' +
+        '<div class="m-sub">' +
+          '<label>权重 <input class="me-weight" type="number" min="1" value="' + esc(m.weight) + '"></label>' +
+          '<span class="chk"><input type="checkbox" class="me-window"' + (limited ? ' checked' : '') + '> 限时生效</span>' +
+          '<span class="chk" title="开启后该成员异常时，后台会用真实请求探活（max_tokens=1）；默认关闭"><input type="checkbox" class="me-probe"' + (m.probe ? ' checked' : '') + '> 异步嗅探</span>' +
+          '<span class="window-inputs"' + (limited ? '' : ' hidden') + '>' +
+            '<label>起 <input class="me-start" type="datetime-local" step="1" value="' + esc(toLocalValue(effective.start)) + '"></label>' +
+            '<label>止 <input class="me-end" type="datetime-local" step="1" value="' + esc(toLocalValue(effective.end)) + '"></label>' +
+          '</span>' +
+          '<span class="m-act">' +
+            '<button class="icon-btn" type="button" data-act="member-up" data-index="' + index + '" title="上移">↑</button>' +
+            '<button class="icon-btn" type="button" data-act="member-down" data-index="' + index + '" title="下移">↓</button>' +
+            '<button class="icon-btn danger" type="button" data-act="member-remove" data-index="' + index + '" title="移除成员">✕</button>' +
+          '</span>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function renderGroupEditor() {
+      const box = document.getElementById('group-editor');
+      if (!draft) {
+        box.innerHTML = '<div class="empty"><b>还没有选中模型组</b>从左侧选择一个组，或点「新建」。</div>';
+        loadMemberStatus();
+        return;
+      }
+      const isNew = !editingGroup;
+      const datalists = products.map(p => '<datalist id="models-' + esc(p.id) + '">' + (modelCache[p.id] || []).map(id => '<option value="' + esc(id) + '"></option>').join('') + '</datalist>').join('');
+      box.innerHTML = datalists +
+        '<div class="editor-head"><h3>' + (isNew ? '新建模型组' : esc(draft.name)) + '</h3>' +
+          (draft.enabled ? chip('启用', 'ok') : chip('停用')) +
+          '<span class="hint">客户端点名 <code>' + esc(draft.name || '待填组名') + '</code></span></div>' +
+        '<div class="field-grid"><label>组名（对外模型名）<input id="ge-name" value="' + esc(draft.name) + '"' + (isNew ? '' : ' disabled') + '></label>' +
+          '<label>组状态<select id="ge-enabled"><option value="1"' + (draft.enabled ? ' selected' : '') + '>启用</option><option value="0"' + (draft.enabled ? '' : ' selected') + '>停用</option></select></label></div>' +
+        '<div class="section-line"><strong>成员</strong><span class="muted">权重越大越优先，同权重按列表顺序；可拖动调整顺序</span></div>' +
+        '<div class="member-list" id="ge-members">' + draft.members.map(memberRowHtml).join('') + '</div>' +
+        '<div class="m-add">' +
+          '<div class="m-add-head"><strong>添加成员</strong><span class="muted" id="ge-add-hint">正在拉取模型目录…</span></div>' +
+          '<div class="m-add-row">' +
+            '<input class="search" id="ge-add-q" placeholder="搜索模型 / 产品">' +
+            '<select id="ge-cands" multiple size="5"></select>' +
+            '<span class="m-add-act">' +
+              '<button class="primary" id="ge-add" type="button">添加所选</button>' +
+              '<button id="ge-add-manual" type="button">手工填一个</button>' +
+            '</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="sticky-save"><button class="primary" id="ge-save" type="button">保存</button><button id="ge-cancel" type="button">取消</button>' +
+          (isNew ? '' : '<button class="danger" id="ge-del" type="button">删除该组</button>') + '</div>';
+      bindEditor();
+      syncModelCache();
+      updateSaveState();
+      loadMemberStatus();
+    }
+
+    function syncModelCache() {
+      products.forEach(product => {
+        if (modelCache[product.id]) return;
+        api('/catalog/fetch?product=' + encodeURIComponent(product.id))
+          .then(payload => {
+            modelCache[product.id] = payload.data || [];
+            const list = document.getElementById('models-' + product.id);
+            if (list) list.innerHTML = modelCache[product.id].map(id => '<option value="' + esc(id) + '"></option>').join('');
+            renderAddCandidates();
+          })
+          .catch(() => { modelCache[product.id] = []; });
+      });
+    }
+
+    function bindEditor() {
+      document.querySelectorAll('#ge-members .member-row').forEach(row => {
+        const member = draft.members[Number(row.dataset.index)];
+        const enabledNode = row.querySelector('.me-enabled');
+        if (enabledNode) enabledNode.addEventListener('change', () => {
+          member.enabled = enabledNode.checked;
+          updateSaveState();
+        });
+        const bind = (selector, apply) => {
+          const node = row.querySelector(selector);
+          if (!node) return;
+          // input 与 change 都监听：边输入边登记改动，保存按钮不必等失焦才亮。
+          const handler = () => { apply(node.value); updateSaveState(); };
+          node.addEventListener('change', handler);
+          node.addEventListener('input', handler);
+        };
+        bind('.me-product', value => {
+          member.product = value;
+          const modelInput = row.querySelector('.me-model');
+          if (modelInput) modelInput.setAttribute('list', 'models-' + value);
+        });
+        bind('.me-model', value => { member.model = value.trim(); });
+        bind('.me-weight', value => { member.weight = Math.max(1, Number(value) || 1); });
+        bind('.me-start', value => { member.effective = Object.assign({ start: '', end: '' }, member.effective, { start: fromLocalValue(value).trim() }); });
+        bind('.me-end', value => { member.effective = Object.assign({ start: '', end: '' }, member.effective, { end: fromLocalValue(value).trim() }); });
+        const probeNode = row.querySelector('.me-probe');
+        if (probeNode) probeNode.addEventListener('change', () => { member.probe = probeNode.checked; updateSaveState(); });
+
+        // 时间区间默认关闭：关闭时清空，避免“看不见的限制”继续生效。
+        const windowToggle = row.querySelector('.me-window');
+        const windowInputs = row.querySelector('.window-inputs');
+        if (windowToggle && windowInputs) {
+          windowToggle.addEventListener('change', () => {
+            windowInputs.hidden = !windowToggle.checked;
+            if (windowToggle.checked) {
+              const startNode = row.querySelector('.me-start');
+              const endNode = row.querySelector('.me-end');
+              if (startNode && !startNode.value) startNode.value = todayDefault('start');
+              if (endNode && !endNode.value) endNode.value = todayDefault('end');
+              member.effective = { start: fromLocalValue(startNode.value), end: fromLocalValue(endNode.value) };
+              updateSaveState();
+            }
+            if (!windowToggle.checked) {
+              row.querySelector('.me-start').value = '';
+              row.querySelector('.me-end').value = '';
+              member.effective = { start: '', end: '' };
+            }
+            // 关闭也是一次改动：必须刷新保存按钮状态，否则会一直停在“无改动”而无法保存。
+            updateSaveState();
+          });
+        }
+
+        // 拖拽排序：顺序即优先级，松手后重算权重。
+        row.addEventListener('dragstart', event => {
+          dragFrom = Number(row.dataset.index);
+          row.classList.add('dragging');
+          event.dataTransfer.effectAllowed = 'move';
+          event.dataTransfer.setData('text/plain', String(dragFrom));
+        });
+        row.addEventListener('dragend', () => { row.classList.remove('dragging'); clearDropTargets(); });
+        row.addEventListener('dragover', event => {
+          event.preventDefault();
+          row.classList.add('drop-target');
+        });
+        row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
+        row.addEventListener('drop', event => {
+          event.preventDefault();
+          const to = Number(row.dataset.index);
+          clearDropTargets();
+          reorderMembers(dragFrom, to);
+        });
+      });
+
+      const nameNode = document.getElementById('ge-name');
+      if (nameNode) nameNode.addEventListener('input', () => { draft.name = nameNode.value.trim(); updateSaveState(); });
+      const enabledSelect = document.getElementById('ge-enabled');
+      if (enabledSelect) enabledSelect.addEventListener('change', () => {
+        draft.enabled = enabledSelect.value === '1';
+        updateSaveState();
+      });
+
+      const query = document.getElementById('ge-add-q');
+      if (query) query.addEventListener('input', renderAddCandidates);
+      document.getElementById('ge-add').onclick = () => {
+        const select = document.getElementById('ge-cands');
+        const picked = Array.from(select.selectedOptions).map(node => node.value);
+        if (!picked.length) { toast('先在候选列表里选中模型'); return; }
+        picked.forEach(value => {
+          const parts = value.split('|');
+          const product = parts[0];
+          const model = parts.slice(1).join('|');
+          if (draft.members.some(m => m.product === product && m.model === model)) return;
+          draft.members.push(newMember(product, model));
+        });
+        renumberWeights();   // 追加后按顺序重排权重，保持“顺序即优先级”不出现并列
+        renderGroupEditor();
+      };
+      document.getElementById('ge-add-manual').onclick = () => {
+        draft.members.push(newMember());
+        renumberWeights();
+        renderGroupEditor();
+      };
+      document.getElementById('ge-save').onclick = saveGroup;
+      document.getElementById('ge-cancel').onclick = () => { editingGroup = null; draft = null; renderGroupList(); renderGroupEditor(); };
+      const del = document.getElementById('ge-del');
+      if (del) del.onclick = deleteGroup;
+      renderAddCandidates();
+    }
+
+    let dragFrom = -1;
+    function clearDropTargets() {
+      document.querySelectorAll('#ge-members .member-row').forEach(node => node.classList.remove('drop-target'));
+    }
+
+    function reorderMembers(from, to) {
+      if (!draft || from < 0 || to < 0 || from === to) return;
+      const moved = draft.members.splice(from, 1)[0];
+      draft.members.splice(to, 0, moved);
+      renumberWeights();
+      renderGroupEditor();
+    }
+
+    // 顺序即优先级：重排后按降序重赋权重，让列表顺序能被选路直接读出来。
+    function renumberWeights() {
+      const total = draft.members.length;
+      draft.members.forEach((member, position) => { member.weight = Math.max(1, (total - position) * 10); });
+    }
+
+    // baseline 是打开编辑器那一刻的规范化快照：与它相同 = 没有任何改动。
+    let baseline = '';
+
+    // 只比较会落盘的字段；__saved 这类前端标记不参与，避免“刚打开就显示有改动”。
+    function normalizeDraft(d) {
+      return JSON.stringify({
+        name: (d.name || '').trim(),
+        enabled: !!d.enabled,
+        members: (d.members || []).map(member => ({
+          product: member.product || '',
+          model: (member.model || '').trim(),
+          weight: Math.max(1, Number(member.weight) || 1),
+          enabled: !!member.enabled,
+          probe: !!member.probe,
+          effective: {
+            start: (member.effective && member.effective.start) || '',
+            end: (member.effective && member.effective.end) || '',
+          },
+        })),
+      });
+    }
+
+    // 成员可用性文案：与后端 memberStatus 的 state 取值一一对应。
+    const memberStateText = {
+      ok: ['可用', 'ok'],
+      cooldown: ['冷却中', 'warn'],
+      breaker: ['熔断中', 'err'],
+      window_out: ['时段外', 'warn'],
+      product_disabled: ['产品停用', 'off'],
+      product_missing: ['产品缺失', 'err'],
+    };
+
+    function renderMemberStatus(rows) {
+      const body = document.getElementById('ge-status');
+      if (!body) return;
+      const note = document.getElementById('group-status-note');
+      if (note) {
+        note.textContent = editingGroup
+          ? editingGroup + ' · ' + rows.length + ' 个启用成员（嗅探会真实请求一次模型，max_tokens=1）'
+          : '选中模型组后显示启用成员的可用性';
+      }
+      if (!rows.length) {
+        body.innerHTML = '<tr class="card"><td colspan="9"><div class="empty"><b>没有启用的成员</b>' +
+          (editingGroup ? '在编辑器里勾选「启用」，或先添加成员。' : '从左侧选择一个模型组。') + '</div></td></tr>';
+        return;
+      }
+      body.innerHTML = rows.map(row => {
+        // 冷却已过期但失败过：显示「曾失败」，避免把刚出过故障的成员读成完全健康。
+        const meta = (row.state === 'ok' && row.fail_streak > 0)
+          ? ['曾失败', 'warn']
+          : (memberStateText[row.state] || [row.state || '-', '']);
+        const cls = meta[1] === 'ok' ? 'ok' : (meta[1] === 'err' ? 'err' : (meta[1] ? 'warn' : ''));
+        return '<tr class="card ' + cls + '">' +
+          '<td class="rail"></td>' +
+          '<td data-label="模型"><span class="id">' + esc(row.model) + '</span></td>' +
+          '<td data-label="产品">' + esc(row.product) + '</td>' +
+          '<td data-label="状态">' + chip(esc(meta[0]), meta[1]) + '</td>' +
+          '<td data-label="原因">' + (row.reason ? '<span class="muted">' + esc(row.reason) + '</span>' : '-') + '</td>' +
+          '<td data-label="解除"><span class="mono">' + (esc(row.unlock_at) || '-') + '</span></td>' +
+          '<td data-label="最近成功"><span class="mono">' + (esc(row.last_ok_at) || '-') + '</span></td>' +
+          '<td data-label="最近嗅探"><span class="mono">' + (esc(row.probed_at) || '-') + '</span></td>' +
+          '<td data-label="操作"><button class="icon-btn" type="button" data-act="sniff-member" data-product="' +
+          esc(row.product) + '" data-model="' + esc(row.model) + '">嗅探</button></td>' +
+          '</tr>';
+      }).join('');
+    }
+
+    async function loadMemberStatus() {
+      const body = document.getElementById('ge-status');
+      if (!body) return;
+      if (!editingGroup) {
+        renderMemberStatus([]);
+        return;
+      }
+      try {
+        const payload = await api('/model-groups/' + encodeURIComponent(editingGroup) + '/members/status');
+        renderMemberStatus(payload.data || []);
+      } catch (err) {
+        box.innerHTML = '<p class="muted">状态加载失败：' + esc(err.message) + '</p>';
+      }
+    }
+
+    // 主动嗅探：让后端打一次下游 /v1/models，探到即清掉冷却 / 熔断。
+    async function sniffMember(product, model) {
+      if (!editingGroup) return;
+      try {
+        const result = await api('/model-groups/' + encodeURIComponent(editingGroup) + '/members/sniff', {
+          method: 'POST', body: JSON.stringify({ version, product, model }),
+        });
+        toast(result.ok
+          ? ('已恢复：' + (result.models || 0) + ' 个模型，' + result.latency_ms + 'ms')
+          : ('仍未恢复：' + (result.reason || '未知原因')));
+        loadMemberStatus();
+      } catch (err) { toast(err.message); }
+    }
+
+    // 没有改动就禁用保存，避免刷新版本号、也避免“以为改了其实没改”。
+    function updateSaveState() {
+      const button = document.getElementById('ge-save');
+      if (!button) return;
+      if (!draft) { button.disabled = true; return; }
+      const nameNode = document.getElementById('ge-name');
+      if (nameNode) draft.name = nameNode.value.trim();
+      const changed = normalizeDraft(draft) !== baseline;
+      button.disabled = !changed;
+      button.title = changed ? '保存到配置文件' : '没有改动，无需保存';
+    }
+
+    async function saveGroup() {
+      const name = (document.getElementById('ge-name').value || '').trim();
+      if (!name) { toast('组名不能为空'); return; }
+      if (normalizeDraft(draft) === baseline) { toast('没有改动，无需保存'); return; }
+      const group = {
+        name,
+        enabled: document.getElementById('ge-enabled').value === '1',
+        members: draft.members.map(m => ({
+          product: m.product,
+          model: (m.model || '').trim(),
+          weight: Math.max(1, Number(m.weight) || 1),
+          enabled: !!m.enabled,
+          probe: !!m.probe,
+          effective: { start: (m.effective && m.effective.start) || '', end: (m.effective && m.effective.end) || '' },
+        })),
+      };
+      try {
+        await api('/model-groups', { method: 'POST', body: JSON.stringify({ version, group }) });
+        toast('已保存');
+        await loadGroups();
+        openGroup(name);   // 保存后继续停在编辑态，避免编辑区被清空
+      } catch (err) { toast(err.message); }
+    }
+
+    async function deleteGroup() {
+      if (!editingGroup) return;
+      if (!confirm('删除模型组 ' + editingGroup + '？')) return;
+      try {
+        await api('/model-groups/' + encodeURIComponent(editingGroup) + '?version=' + version, { method: 'DELETE' });
+        toast('已删除');
+        editingGroup = null;
+        draft = null;
+        await loadGroups();
+      } catch (err) { toast(err.message); }
+    }
+
+    function moveMember(index, dir) {
+      if (!draft) return;
+      const target = dir === 'up' ? index - 1 : index + 1;
+      if (target < 0 || target >= draft.members.length) { toast('已经在最前/最后'); return; }
+      reorderMembers(index, target);
+    }
+
+    function removeMember(index) {
+      if (!draft) return;
+      draft.members.splice(index, 1);
+      renumberWeights();
+      renderGroupEditor();
+    }
+
+    function openGroup(name) {
+      editingGroup = name || '';
+      if (name) {
+        const found = groups.find(item => item.name === name);
+        draft = found ? JSON.parse(JSON.stringify(found)) : { name, enabled: true, members: [] };
+        draft.members = groupSorted(draft);
+      } else {
+        draft = { name: '', enabled: true, members: [] };
+        draft.members.push(newMember());
+      }
+      // 已存在于配置里的成员：产品/模型锁定；本次新加的仍可调整到保存为止。
+      draft.members.forEach(member => { member.__saved = !!name; });
+      baseline = normalizeDraft(draft);
+      renderGroupList();
+      renderGroupEditor();
+    }
+
+    // ---------- 日志 ----------
+    async function loadLogs() {
+      const query = new URLSearchParams({ size: '50' });
+      const from = document.getElementById('log-from').value;
+      const to = document.getElementById('log-to').value;
+      const outcome = document.getElementById('log-outcome').value;
+      if (from) query.set('from', from);
+      if (to) query.set('to', to);
+      if (outcome) query.set('outcome', outcome);
+      const payload = await api('/logs?' + query.toString());
+      const rows = payload.data || [];
+      document.getElementById('logs-body').innerHTML = rows.map(entry =>
+        '<tr class="card ' + outcomeClass(entry.outcome) + '">' +
+        rail() +
+        cell('时间', '<span class="mono">' + esc((entry.time || '').slice(5)) + '</span>') +
+        cell('Token', esc(entry.token_name || entry.token_id || '-')) +
+        cell('模型组', '<span class="id">' + esc(entry.group) + '</span>') +
+        cell('命中成员', '<span class="mono">' + esc((entry.product || '-') + '/' + (entry.model || '-')) + '</span>') +
+        cell('状态', '<span class="num">' + esc(entry.http_status || 0) + '</span>') +
+        cell('结果', chip(esc(entry.outcome || '-'), outcomeClass(entry.outcome))) +
+        cell('耗时', '<span class="num">' + esc(entry.duration_ms || 0) + '</span> ms <span class="muted">首包 ' + esc(entry.ttfb_ms || 0) + '</span>') +
+        cell('尝试链路', attemptChain(entry.attempts)) +
+        '</tr>').join('') || '<tr class="card"><td colspan="9"><div class="empty"><b>这个范围内没有请求</b>换个时间范围，或先跑一次 /v1/chat/completions。</div></td></tr>';
+      const total = payload.total || 0;
+      const downgraded = rows.filter(item => (item.attempts || []).length > 1).length;
+      document.getElementById('log-summary').textContent = '共 ' + total + ' 条' + (rows.length ? '（本页降级 ' + downgraded + ' 条）' : '');
+    }
+
+    // ---------- Token ----------
+    async function loadTokens() {
+      const payload = await api('/tokens');
+      const rows = payload.data || [];
+      tokenRows = rows;
+      document.getElementById('tokens-body').innerHTML = rows.map(t =>
+        '<tr class="card ' + (t.enabled ? 'ok' : '') + '">' +
+        rail() +
+        cell('名称', esc(t.name)) +
+        cell('前缀', '<span class="id">' + esc(t.key_prefix) + '…</span>') +
+        cell('允许的组', (t.groups || []).map(g => chip(esc(g), g === '*' ? '' : 'ok')).join(' ')) +
+        cell('状态', t.enabled ? chip('启用', 'ok') : chip('停用')) +
+        cell('创建时间', '<span class="mono">' + esc(t.created_at) + '</span>') +
+        cell('使用', '<span class="num">' + (t.request_count || 0) + '</span> 次' + (t.last_used_at ? '<br><span class="muted mono">' + esc(t.last_used_at) + '</span>' : '')) +
+        cell('操作', '<button data-act="toggle-token" data-id="' + esc(t.id) + '" data-on="' + (t.enabled ? '0' : '1') + '">' + (t.enabled ? '停用' : '启用') + '</button>' +
+          '<button data-act="edit-token" data-id="' + esc(t.id) + '">改允许组</button>' +
+          '<button class="danger" data-act="del-token" data-id="' + esc(t.id) + '">删除</button>') +
+        '</tr>').join('') || '<tr class="card"><td colspan="8"><div class="empty"><b>还没有 Token</b>新建一个分发给脚本或客户端。</div></td></tr>';
+    }
+
+    function openToken() {
+      const options = groups.map(g => '<option value="' + esc(g.name) + '">' + esc(g.name) + '</option>').join('');
+      showDrawer('<h3>新建 Token</h3>' +
+        '<div class="row"><label>名称<input id="t-name" placeholder="脚本名"></label></div>' +
+        '<div class="row"><label>允许的组（多选，或选 * 全部）<select id="t-groups" multiple size="6"><option value="*">*（全部）</option>' + options + '</select></label></div>' +
+        '<div class="sticky-save"><button class="primary" id="t-save" type="button">生成</button><button id="t-cancel" type="button">取消</button></div>', () => {
+          const selected = Array.from(document.getElementById('t-groups').selectedOptions).map(o => o.value);
+          api('/tokens', { method: 'POST', body: JSON.stringify({ version, name: document.getElementById('t-name').value.trim(), groups: selected }) })
+            .then(payload => {
+              showDrawer('<h3>Token 已创建</h3><p class="muted">完整 key 仅显示这一次，请立即保存。</p>' +
+                '<p><code style="word-break:break-all">' + esc(payload.plain) + '</code></p>' +
+                '<div class="sticky-save"><button class="primary" id="t-close" type="button">我已保存</button></div>', null);
+              document.getElementById('t-close').onclick = () => { closeDrawer(); loadTokens(); };
+            })
+            .catch(err => toast(err.message));
+        });
+    }
+
+    // 改允许组：抽屉里用多选下拉，避免让用户手敲逗号分隔字符串。
+    function openTokenGroups(id) {
+      const record = tokenRows.find(item => item.id === id);
+      if (!record) return;
+      const selected = record.groups || [];
+      const options = groups.map(g => '<option value="' + esc(g.name) + '"' +
+        (selected.indexOf(g.name) >= 0 ? ' selected' : '') + '>' + esc(g.name) + '</option>').join('');
+      showDrawer('<h3>改允许组 · ' + esc(record.name || record.key_prefix) + '</h3>' +
+        '<div class="row"><label>允许访问的模型组（可多选；选 * 表示全部）' +
+        '<select id="tg-groups" multiple size="8"><option value="*"' +
+        (selected.indexOf('*') >= 0 ? ' selected' : '') + '>*（全部）</option>' + options + '</select></label></div>' +
+        '<div class="sticky-save"><button class="primary" id="tg-save" type="button">保存</button>' +
+        '<button id="tg-cancel" type="button">取消</button></div>', () => {
+          const picked = Array.from(document.getElementById('tg-groups').selectedOptions).map(option => option.value);
+          api('/tokens/' + encodeURIComponent(record.id), { method: 'PUT', body: JSON.stringify({ version, groups: picked }) })
+            .then(() => { closeDrawer(); toast('已更新允许组'); loadTokens(); })
+            .catch(err => toast(err.message));
+        });
+    }
+
+    // ---------- 模型列表 ----------
+    let modelRows = [];
+
+    async function loadModels() {
+      const payload = await api('/models');
+      modelRows = payload.data || [];
+      const select = document.getElementById('model-product');
+      if (select) {
+        const current = select.value;
+        select.innerHTML = '<option value="">全部产品</option>' + modelRows.map(row =>
+          '<option value="' + esc(row.id) + '">' + esc(row.name || row.id) + '</option>').join('');
+        select.value = current;
+      }
+      renderModels();
+    }
+
+    function renderModels() {
+      const body = document.getElementById('models-body');
+      const note = document.getElementById('model-note');
+      if (!body) return;
+      const productFilter = (document.getElementById('model-product') || {}).value || '';
+      const keyword = ((document.getElementById('model-q') || {}).value || '').trim().toLowerCase();
+      const rows = modelRows.filter(row => !productFilter || row.id === productFilter);
+      let total = 0;
+      const html = rows.map(row => {
+        const models = (row.models || []).filter(id => !keyword || id.toLowerCase().includes(keyword));
+        total += models.length;
+        if (!models.length) {
+          return '<tr class="group-head"><td colspan="5">' + esc(row.name || row.id) +
+            ' · 0 个模型' + (row.updated_at ? ' · 更新于 ' + esc(row.updated_at) : ' · 尚未拉取') +
+            (row.failure ? ' · ' + esc(row.failure) : '') + '</td></tr>';
+        }
+        return '<tr class="group-head"><td colspan="5">' + esc(row.name || row.id) + ' · ' + models.length + ' 个模型' +
+          (row.updated_at ? ' · 更新于 ' + esc(row.updated_at) : '') +
+          (row.failure ? ' · 最近失败：' + esc(row.failure) : '') + '</td></tr>' +
+          models.map(id => '<tr class="card ok"><td class="rail"></td>' +
+            '<td data-label="模型"><span class="id">' + esc(id) + '</span></td>' +
+            '<td data-label="产品">' + esc(row.id) + '</td>' +
+            '<td data-label="更新时间"><span class="mono">' + (esc(row.updated_at) || '-') + '</span></td>' +
+            '<td data-label="状态">' + chip(row.enabled ? '启用' : '停用', row.enabled ? 'ok' : 'off') + '</td>' +
+            '</tr>').join('');
+      }).join('');
+      body.innerHTML = html || '<tr class="card"><td colspan="5"><div class="empty"><b>没有模型</b>点「刷新（回源）」拉一次上游。</div></td></tr>';
+      if (note) {
+        const withModels = rows.filter(row => (row.count || 0) > 0).length;
+        note.textContent = rows.length + ' 个产品 · ' + total + ' 个模型命中 · 已缓存 ' + withModels + ' 个产品' +
+          '（缓存 10 分钟内直接读文件）';
+      }
+    }
+
+    async function refreshModels() {
+      const product = (document.getElementById('model-product') || {}).value || '';
+      try {
+        const result = await api('/models/refresh', { method: 'POST', body: JSON.stringify({ product }) });
+        toast('已回源 ' + result.updated + ' 个产品' + (result.failed && result.failed.length ? '，失败：' + result.failed.join(',') : ''));
+        await loadModels();
+      } catch (err) { toast(err.message); }
+    }
+
+    // ---------- 通用配置 ----------
+    async function loadSettings() {
+      const payload = await api('/settings');
+      bootstrapMode = !!payload.admin_bootstrap;
+      const view = payload.settings || {};
+      const routing = view.routing || {};
+      const cooldown = routing.cooldown || {};
+      const sticky = routing.sticky || {};
+      const probe = view.probe || {};
+      const logging = view.logging || {};
+      const startup = view.startup || {};
+      const set = (id, value) => { const node = document.getElementById(id); if (node) node.value = value; };
+      const check = (id, value) => { const node = document.getElementById(id); if (node) node.checked = !!value; };
+      set('set-listen', startup.listen || '');
+      set('set-data-dir', startup.data_dir || '');
+      // 口令不回显：每次加载都清空，留空即表示不修改。
+      set('set-admin-token', '');
+      const hint = document.getElementById('set-admin-hint');
+      if (hint) {
+        const parts = [];
+        parts.push(payload.admin_token_set
+          ? '已设置管理口令（只保存 SHA-256）。留空表示不修改；改完需重启，重启后用新口令登录。'
+          : '尚未设置管理口令：当前处于初始化模式，免登录且仅本机可访问。填一个口令并重启即完成初始化。');
+        if (payload.pending_restart) parts.push('当前实际监听 ' + (payload.active_listen || '-') + '，重启后才会切到新地址。');
+        hint.textContent = parts.join(' ');
+      }
+      // 初始化模式没有「退出」的意义（本来就没有登录态），按钮改为引导设置口令。
+      const logout = document.getElementById('logout');
+      if (logout) logout.textContent = payload.admin_bootstrap ? '设置口令' : '退出';
+      set('set-attempts', routing.max_attempts || 1);
+      set('set-cd-base', cooldown.base || '');
+      set('set-cd-max', cooldown.max || '');
+      set('set-cd-threshold', cooldown.fail_threshold || 0);
+      set('set-cd-open', cooldown.open_duration || '');
+      check('set-prefer', routing.prefer_last_ok);
+      check('set-sticky', sticky.enabled);
+      set('set-sticky-ttl', sticky.ttl || '');
+      check('set-probe', probe.enabled);
+      set('set-probe-interval', probe.interval || '');
+      set('set-probe-min-gap', probe.min_gap || '');
+      set('set-log-dir', logging.dir || '');
+      set('set-log-retention', logging.retention_days || 1);
+      set('set-log-maxmb', logging.max_file_mb || 100);
+      version = payload.version;
+      document.getElementById('version').textContent = 'config v' + version;
+    }
+
+    async function saveSettings() {
+      const value = id => (document.getElementById(id) || {}).value || '';
+      const checked = id => !!(document.getElementById(id) || {}).checked;
+      const body = {
+        version,
+        settings: {
+          startup: {
+            listen: value('set-listen').trim(),
+            data_dir: value('set-data-dir').trim(),
+            admin_token: value('set-admin-token').trim(),
+          },
+          routing: {
+            max_attempts: Number(value('set-attempts')) || 1,
+            prefer_last_ok: checked('set-prefer'),
+            cooldown: {
+              base: value('set-cd-base').trim(),
+              max: value('set-cd-max').trim(),
+              fail_threshold: Number(value('set-cd-threshold')) || 0,
+              open_duration: value('set-cd-open').trim(),
+            },
+            sticky: { enabled: checked('set-sticky'), ttl: value('set-sticky-ttl').trim() },
+          },
+          probe: {
+            enabled: checked('set-probe'),
+            interval: value('set-probe-interval').trim(),
+            min_gap: value('set-probe-min-gap').trim(),
+          },
+          logging: {
+            dir: value('set-log-dir').trim(),
+            retention_days: Number(value('set-log-retention')) || 1,
+            max_file_mb: Number(value('set-log-maxmb')) || 100,
+          },
+        },
+      };
+      try {
+        const result = await api('/settings', { method: 'POST', body: JSON.stringify(body) });
+        version = result.version;
+        document.getElementById('version').textContent = 'config v' + result.version;
+        toast('配置已保存（探活间隔下一轮生效；监听/数据目录/管理口令需重启）');
+        await loadSettings();
+      } catch (err) { toast(err.message); }
+    }
+
+    // ---------- 抽屉与路由 ----------
+    let drawerSave = null;
+    function showDrawer(html, onSave, onAdd) {
+      const body = document.getElementById('drawer-body');
+      body.innerHTML = html;
+      document.getElementById('drawer').classList.add('show');
+      drawerSave = onSave;
+      const save = body.querySelector('#f-save, #t-save, #tg-save');
+      if (save && onSave) save.onclick = onSave;
+      const cancel = body.querySelector('#f-cancel, #t-cancel, #tg-cancel');
+      if (cancel) cancel.onclick = closeDrawer;
+    }
+    function closeDrawer() { document.getElementById('drawer').classList.remove('show'); drawerSave = null; }
+    document.getElementById('drawer').addEventListener('click', event => { if (event.target.id === 'drawer') closeDrawer(); });
+
+    document.addEventListener('click', event => {
+      const target = event.target.closest('[data-act]');
+      if (!target) return;
+      const act = target.dataset.act;
+      if (act === 'edit-product') return openProduct(target.dataset.id);
+      if (act === 'toggle-product') return api('/products/' + encodeURIComponent(target.dataset.id), { method: 'PUT', body: JSON.stringify({ version, enabled: target.dataset.on === '1' }) }).then(loadProducts).catch(e => toast(e.message));
+      if (act === 'del-product') { if (confirm('删除产品 ' + target.dataset.id + '？')) api('/products/' + encodeURIComponent(target.dataset.id) + '?version=' + version, { method: 'DELETE' }).then(loadProducts).catch(e => toast(e.message)); return; }
+      if (act === 'models') return api('/catalog/fetch?refresh=1&product=' + encodeURIComponent(target.dataset.id)).then(p => { modelCache[target.dataset.id] = p.data || []; toast('已拉取 ' + (p.data || []).length + ' 个模型'); }).catch(e => toast(e.message));
+      if (act === 'test-product') return api('/products/' + encodeURIComponent(target.dataset.id) + '/test', { method: 'POST' })
+        .then(p => toast(p.ok ? ('连通正常：' + p.count + ' 个模型，' + p.latency_ms + 'ms') : ('连通失败：' + p.error + '（' + p.latency_ms + 'ms）')))
+        .catch(e => toast(e.message));
+      if (act === 'select-group') return openGroup(target.dataset.name);
+      if (act === 'member-up') return moveMember(Number(target.dataset.index), 'up');
+      if (act === 'member-down') return moveMember(Number(target.dataset.index), 'down');
+      if (act === 'member-remove') return removeMember(Number(target.dataset.index));
+      if (act === 'sniff-member') return sniffMember(target.dataset.product, target.dataset.model);
+      if (act === 'toggle-token') return api('/tokens/' + encodeURIComponent(target.dataset.id), { method: 'PUT', body: JSON.stringify({ version, enabled: target.dataset.on === '1' }) }).then(loadTokens).catch(e => toast(e.message));
+      if (act === 'edit-token') return openTokenGroups(target.dataset.id);
+      if (act === 'del-token') { if (confirm('删除该 Token？')) api('/tokens/' + encodeURIComponent(target.dataset.id) + '?version=' + version, { method: 'DELETE' }).then(loadTokens).catch(e => toast(e.message)); }
+    });
+
+    document.getElementById('product-new').onclick = () => openProduct('');
+    document.getElementById('group-new').onclick = () => openGroup('');
+    document.getElementById('token-new').onclick = openToken;
+    document.getElementById('log-refresh').onclick = () => loadLogs().catch(e => toast(e.message));
+    document.getElementById('ge-status-refresh').onclick = () => loadMemberStatus();
+    document.getElementById('model-refresh').onclick = () => refreshModels();
+    document.getElementById('model-product').onchange = () => renderModels();
+    document.getElementById('model-q').addEventListener('input', () => renderModels());
+    document.getElementById('settings-save').onclick = () => saveSettings();
+
+    const pageMeta = {
+      products: ['产品', '下游 *2api 实例在这里登记，模型组按产品挑成员。'],
+      groups: ['模型组', '组名即对外模型名；权重越大越优先，同权重按列表顺序。'],
+      models: ['模型', '各产品可用的模型清单，落盘缓存，过期或缺文件才回源。'],
+      logs: ['请求日志', '每次请求命中了谁、降级了几次、首包多慢。'],
+      tokens: ['Token', '对外分发的虚拟 key，只存哈希与前缀。'],
+      settings: ['配置', '选路、熔断、探活与日志这些通用参数。'],
+    };
+    const views = ['products', 'groups', 'models', 'logs', 'tokens', 'settings'];
+    function route() {
+      const view = views.find(item => location.pathname.endsWith('/' + item)) || 'products';
+      document.querySelectorAll('nav a').forEach(a => a.classList.toggle('active', a.dataset.view === view));
+      document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === view));
+      document.getElementById('page-title').textContent = pageMeta[view][0];
+      document.getElementById('page-sub').textContent = pageMeta[view][1];
+      const task = view === 'groups' ? loadGroups()
+        : view === 'models' ? loadModels()
+        : view === 'logs' ? loadLogs()
+        : view === 'tokens' ? loadTokens()
+        : view === 'settings' ? loadSettings()
+        : loadProducts();
+      task.catch(err => toast(err.message));
+    }
+    document.querySelectorAll('nav a').forEach(a => a.addEventListener('click', event => {
+      event.preventDefault();
+      history.pushState({}, '', a.href);
+      route();
+    }));
+    window.addEventListener('popstate', route);
+
+    // 有口令就先按口令进；没有口令时探测一次：能通说明是初始化模式（仅本机），直接进配置页设口令。
+    async function boot() {
+      if (token()) {
+        await loadVersion();
+        if (!bootstrapMode) { route(); return; }
+      }
+      try {
+        const payload = await api('/config/version');
+        bootstrapMode = true;
+        version = payload.version;
+        document.getElementById('version').textContent = 'config v' + version;
+        hideLogin();
+        toast('尚未设置管理口令：当前免登录且仅本机可访问，请到「配置 → 启动参数」设置后重启');
+        history.replaceState({}, '', '/panel/settings');
+        route();
+      } catch (err) {
+        if (!token()) showLogin('');
+        else showLogin(err.message);
+      }
+    }
+    boot();
+  </script>
+</body>
+</html>

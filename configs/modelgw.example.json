@@ -1,0 +1,66 @@
+{
+    "version": 1,
+    "listen": ":8080",
+    "admin_token_sha256": "",
+    "data_dir": "./data",
+    "routing": {
+        "max_attempts": 4,
+        "cooldown": {
+            "base": "2s",
+            "max": "60s",
+            "fail_threshold": 3,
+            "open_duration": "5m"
+        },
+        "prefer_last_ok": true,
+        "sticky": {
+            "enabled": true,
+            "ttl": "30m"
+        }
+    },
+    "probe": {
+        "enabled": true,
+        "interval": "60s",
+        "min_gap": "30s"
+    },
+    "logging": {
+        "dir": "./logs",
+        "retention_days": 14,
+        "max_file_mb": 64
+    },
+    "products": [
+        {
+            "id": "upstream-a",
+            "name": "上游 A",
+            "protocol": "openai-chat",
+            "base_url": "http://127.0.0.1:8000",
+            "api_key": "sk-****",
+            "enabled": true,
+            "timeout": {
+                "connect": "5s",
+                "first_byte": "30s",
+                "total": "300s"
+            },
+            "headers": {},
+            "note": ""
+        }
+    ],
+    "model_groups": [
+        {
+            "name": "gpt-5",
+            "enabled": true,
+            "members": [
+                {
+                    "product": "upstream-a",
+                    "model": "gpt-5",
+                    "weight": 100,
+                    "enabled": true,
+                    "effective": {
+                        "start": "",
+                        "end": ""
+                    }
+                }
+            ]
+        }
+    ],
+    "tokens": []
+}

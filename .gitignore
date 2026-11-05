@@ -1,0 +1,18 @@
+# 构建产物
+/model-gateway
+/model-gateway.exe
+/dist/
+*.exe
+*.exe~
+
+# 运行态与业务配置：只提交 configs/modelgw.example.json，真实配置不入库
+/data/
+/configs/*.json
+!/configs/modelgw.example.json
+*.bak
+*.tmp
+
+# 本地临时文件
+.tmp/
+*.log
+__pycache__/

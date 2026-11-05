@@ -1,0 +1,89 @@
+name: binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: test
+        run: go test ./...
+
+      - name: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)" >> "$GITHUB_ENV"
+          fi
+
+      - name: build
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          pack() {
+            dir="dist/$1-$2"
+            mkdir -p "$dir"
+            cp "$3" "$dir/"
+            cp configs/modelgw.example.json README.md "$dir/"
+            python3 -c 'import os,sys,zipfile; n,d=sys.argv[1:]; z=zipfile.ZipFile(n,"w",zipfile.ZIP_DEFLATED); [z.write(os.path.join(d,f), f) for f in os.listdir(d)]; z.close()' \
+              "dist/model-gateway-${VERSION}-$1-$2.zip" "$dir"
+          }
+          for os in windows linux darwin; do
+            bin=model-gateway
+            [ "$os" = windows ] && bin=model-gateway.exe
+            for arch in amd64 arm64; do
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+                go build -trimpath -ldflags="-s -w" -o "$bin" ./cmd/model-gateway
+              pack "$os" "$arch" "$bin"
+            done
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-gateway-${{ env.VERSION }}-windows-amd64
+          path: dist/windows-amd64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-gateway-${{ env.VERSION }}-windows-arm64
+          path: dist/windows-arm64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-gateway-${{ env.VERSION }}-linux-amd64
+          path: dist/linux-amd64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-gateway-${{ env.VERSION }}-linux-arm64
+          path: dist/linux-arm64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-gateway-${{ env.VERSION }}-darwin-amd64
+          path: dist/darwin-amd64
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-gateway-${{ env.VERSION }}-darwin-arm64
+          path: dist/darwin-arm64
+          if-no-files-found: error
+
+      - name: release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${VERSION}" dist/*.zip --title "v${VERSION}" --generate-notes
