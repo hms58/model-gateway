@@ -1,0 +1,35 @@
+# 统一换行：仓库内一律存 LF，检出时按平台还原。
+# 没有这层约束时，Windows 的 core.autocrlf=true 会把入库的 .sh 也转成 CRLF，
+# 脚本传到 Linux 上执行就会报 "bad interpreter: /bin/bash^M"。
+
+* text=auto eol=lf
+
+# 明确按文本处理并强制 LF：跨平台执行 / 解析的脚本与配置
+*.sh      text eol=lf
+*.bash    text eol=lf
+Makefile  text eol=lf
+*.mk      text eol=lf
+*.go      text eol=lf
+*.mod     text eol=lf
+*.sum     text eol=lf
+*.json    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.md      text eol=lf
+*.html    text eol=lf
+*.css     text eol=lf
+*.js      text eol=lf
+*.txt     text eol=lf
+.gitignore        text eol=lf
+.gitattributes    text eol=lf
+
+# 二进制：不参与换行转换与文本 diff
+*.exe     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.svg     text eol=lf
+*.zip     binary
+*.gz      binary
