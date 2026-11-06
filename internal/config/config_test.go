@@ -42,6 +42,50 @@ func TestValidateRejectsInvertedWindow(t *testing.T) {
 	}
 }
 
+// 每日时段允许跨天（23:00-07:00）与同天（09:00-18:00），秒可省略。
+func TestValidateAcceptsDailyWindow(t *testing.T) {
+	tests := []struct {
+		name   string
+		window DailyWindow
+	}{
+		{"跨天", DailyWindow{Start: "23:00", End: "07:00"}},
+		{"同天", DailyWindow{Start: "09:00", End: "18:00"}},
+		{"带秒", DailyWindow{Start: "23:00:30", End: "07:00:15"}},
+		{"两端留空", DailyWindow{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.ModelGroups[0].Members[0].Daily = tc.window
+			if err := Validate(&cfg); err != nil {
+				t.Fatalf("合法每日时段被拒：%v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsInvalidDailyWindow(t *testing.T) {
+	tests := []struct {
+		name   string
+		window DailyWindow
+	}{
+		{"只填起点", DailyWindow{Start: "23:00"}},
+		{"只填终点", DailyWindow{End: "07:00"}},
+		{"起止相同", DailyWindow{Start: "23:00", End: "23:00"}},
+		{"格式非法", DailyWindow{Start: "23点", End: "07:00"}},
+		{"越界时刻", DailyWindow{Start: "24:00", End: "07:00"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.ModelGroups[0].Members[0].Daily = tc.window
+			if err := Validate(&cfg); !errors.Is(err, ErrInvalidWindow) {
+				t.Fatalf("期望 ErrInvalidWindow，实际 %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsDuplicateMember(t *testing.T) {
 	cfg := validConfig()
 	cfg.ModelGroups[0].Members = append(cfg.ModelGroups[0].Members, cfg.ModelGroups[0].Members[0])

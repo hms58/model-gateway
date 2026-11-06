@@ -155,7 +155,7 @@ export MODELGW_ADMIN_TOKEN='your-strong-token'
 | `routing` | 最大尝试次数、冷却与熔断、粘性会话 |
 | `probe` | 异常成员后台探活（间隔、同产品节流） |
 | `logging` | 请求日志目录、保留天数 |
-| `products` | 下游产品：`base_url` / `api_key` / 超时 |
+| `products` | 下游产品：`base_url` / `api_key` / 超时 / 端点路径 / 出网代理（默认关闭）/ `disabled_models`（停用模型） |
 | `model_groups` | 对外模型组：成员 = 产品 + 真实模型 + 权重 |
 | `tokens` | 虚拟 Token（只存 SHA-256，明文仅创建时返回一次） |
 
@@ -166,6 +166,7 @@ export MODELGW_ADMIN_TOKEN='your-strong-token'
 | `state.json` | 冷却 / 熔断 / Token 计数 / 产品健康，5s 合并落盘 |
 | `models.json` | 各产品模型列表缓存（10 分钟内直接读文件） |
 | `logs/` | 按天 `requests-YYYYMMDD.jsonl`，保留期到期自动清理 |
+| `usage.json` | 请求与 token 用量累计：小时桶保留 90 天后折叠为日桶（永久），面板「统计」页的数据源；**不受日志保留期影响** |
 
 ### 接三家上游：最小可用配置
 
@@ -203,6 +204,53 @@ export MODELGW_ADMIN_TOKEN='your-strong-token'
 ]
 ```
 
+### 接入非标准 OpenAI 兼容端点（`chat_path` / `models_path`）
+
+默认按 `base_url + /v1/chat/completions` 与 `base_url + /v1/models` 出网，覆盖绝大多数上游。
+遇到路径不含 `/v1` 段或需要查询串的服务，用这两个字段覆盖（留空即用默认值）：
+
+| 服务 | `base_url` | `chat_path` | `models_path` |
+| --- | --- | --- | --- |
+| OpenAI 官方 | `https://api.openai.com` | 默认 | 默认 |
+| OpenRouter | `https://openrouter.ai/api` | 默认 | 默认 |
+| DeepSeek / Moonshot | `https://api.deepseek.com` | 默认 | 默认 |
+| 通义 DashScope 兼容模式 | `https://dashscope.aliyuncs.com/compatible-mode` | 默认 | 默认 |
+| **Gemini（OpenAI 兼容层）** | `https://generativelanguage.googleapis.com/v1beta/openai` | `/chat/completions` | `/models` |
+| **Azure OpenAI** | `https://<res>.openai.azure.com` | `/openai/deployments/<dep>/chat/completions?api-version=2024-06-01` | 默认 |
+
+```json
+"chat_path": "/chat/completions",
+"models_path": "/models"
+```
+
+约束：只能是**站内路径**（以 `/` 开头、不能是完整 URL），允许带查询串；填错会在保存时被拦下。
+Gemini 的原生 API（`/v1beta/models/<m>:generateContent`）不是 OpenAI 协议，本网关不支持，
+只能走它的 OpenAI 兼容层。
+
+### 每个产品单独设置出网代理（默认关闭）
+
+`products[].proxy` 缺省即直连；开启后，该产品下的**聊天转发、拉取模型目录、主动嗅探/一键嗅探**
+三条出网路径都走同一个代理，不会出现「业务请求通、面板拉不到模型」的分裂状态。
+
+```json
+"proxy": {
+  "enabled": true,
+  "url": "socks5://user:pass@127.0.0.1:1080"
+}
+```
+
+| 协议 | 写法 | 说明 |
+| --- | --- | --- |
+| HTTP | `http://127.0.0.1:7890` | 明文 HTTP 代理 |
+| HTTPS | `https://proxy.example.com:443` | 到代理本身用 TLS |
+| SOCKS5 | `socks5://127.0.0.1:1080` | 本机解析目标域名 |
+| SOCKS5h | `socks5h://127.0.0.1:1080` | 由代理侧解析目标域名，避免 DNS 泄漏 |
+
+由 Go 标准库 `net/http` 原生实现，无第三方依赖。认证信息放在 URL 的 `user:pass@` 里，
+管理接口只回显掩码（`user:********@`），保存时保持掩码即表示不修改密码。
+面板「产品 → 编辑 → 出网代理」可视化配置，列表中用「直连 / 协议名」显示当前状态；
+填了非法协议或空地址会在保存时被拦下，不会等到真实请求才失败。
+
 `model_groups` 把三家同一个模型挂成一组，`weight` 决定先用谁：**同一份模型在三家都有时，
 按「哪家额度更该先出清 / 更稳」排权重**，失败自动往下一个降级：
 
@@ -236,6 +284,9 @@ export MODELGW_ADMIN_TOKEN='your-strong-token'
 - 同组允许「不同上游 + 同名模型」并列，这就是跨产品降级；也允许同一产品挂多个模型做型号降级。
 - 某个上游整体不可用时，把该产品 `enabled` 设为 `false`，组内成员自动跳过，不用改组。
 - 首次接上游后到 `/panel/models` 点「刷新（回源）」拉一次真实模型清单，避免把不存在的模型写进组。
+- 成员可选两种时段限制：`effective`（带日期的绝对区间，面板上的「限时生效」）与 `daily`（每天重复的时段，
+  如 `{"start":"23:00","end":"07:00"}`；起点晚于终点即跨天，当天 23:00 到次日 07:00）。两者同时开启时，
+  **两个都命中**才参与选路。
 
 ## 数据面
 
@@ -290,8 +341,9 @@ curl ... -H "X-Session-Id: my-conversation-42"
 | --- | --- |
 | `/panel/products` | 产品增删改、连通性测试、key 掩码展示 |
 | `/panel/groups` | 模型组成员、权重上下移、成员状态与手动嗅探 |
-| `/panel/models` | 各产品模型清单（可强制回源刷新） |
-| `/panel/logs` | 请求日志查询（按结果 / 产品 / 状态码 / 关键字） |
+| `/panel/models` | 各产品模型清单（可强制回源刷新）；**停用的产品不列出**，单个模型可停用/启用（被模型组使用的不能停用；停用状态按「产品 + 模型名」保存，刷新目录后仍保留） |
+| `/panel/logs` | 请求日志查询（按结果 / 产品 / 状态码 / 关键字），分页默认 100 条/页（上限 100），可选 50/100，支持 5s 自动刷新（只存浏览器） |
+| `/panel/usage` | 统计：请求次数、成功率、平均耗时、token 用量与缓存命中率；按天趋势（默认近 7 天）+ 按「产品 + 模型」的 token Top。**不含积分维度** |
 | `/panel/tokens` | 虚拟 Token 创建、启停、组授权 |
 | `/panel/settings` | 启动参数（监听 / 数据目录 / 管理口令）+ 选路、熔断、探活、日志 |
 
@@ -368,7 +420,9 @@ python -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdige
 | 手动嗅探 | 面板「嗅探」按钮 | 立即对单个成员发一次真实请求，同上 |
 
 `probe.min_gap` 是同一产品的探活节流。探活失败只更新 `last_error`，不会把成员重新打进熔断。
-`/v1/models` 只能判断产品是否在线，**模型是否可用必须真实请求**，所以探活约消耗 1 token，默认按成员逐个开启。
+`/v1/models` 只能判断产品是否在线，**模型是否可用必须真实请求**，所以探活约消耗 1 token。
+后台异步嗅探按**模型组**开关（`model_groups[].probe`）：开启则组内所有成员都参与，关闭则整组都不参与，默认关闭；
+运行状态里的「一键嗅探」不依赖该开关，会串行探测本组所有异常成员。
 
 ## 目录结构
 

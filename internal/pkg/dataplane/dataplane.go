@@ -19,11 +19,21 @@ import (
 	"model-gateway/internal/pkg/reqlog"
 	"model-gateway/internal/pkg/store"
 	"model-gateway/internal/pkg/token"
+	"model-gateway/internal/pkg/usage"
 	"model-gateway/internal/router"
 )
 
 // MaxBodyBytes 限制请求体，避免超大 messages 打爆内存。
 const MaxBodyBytes = 32 << 20
+
+// statusClientClosed 沿用 Nginx 的 499：客户端在收到响应前断开，便于日志区分。
+const statusClientClosed = 499
+
+// clientGone 判断入站请求是否已断开：此时下游失败不是上游故障，
+// 不应继续降级，更不该把成员打进冷却。
+func clientGone(r *http.Request) bool {
+	return r.Context().Err() != nil
+}
 
 type Handler struct {
 	store     *store.Store
@@ -31,11 +41,19 @@ type Handler struct {
 	mu        sync.Mutex
 	rnd       *rand.Rand
 	logger    *reqlog.Logger
+	usage     *usage.Recorder
 }
 
 // WithLogger 注入请求日志器；未注入时不记日志（不影响转发）。
 func (h *Handler) WithLogger(logger *reqlog.Logger) *Handler {
 	h.logger = logger
+	return h
+}
+
+// WithUsage 注入用量累计器（面板「统计」页的数据源）；未注入时不统计。
+// 与请求日志相互独立：日志受保留期限制会删文件，累计器自己折叠后长期保留。
+func (h *Handler) WithUsage(recorder *usage.Recorder) *Handler {
+	h.usage = recorder
 	return h
 }
 
@@ -126,25 +144,42 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastTTFB int64
 	var lastUsage proxy.Usage
 	var lastProduct string
+	// 400/422 的上游响应要留着：所有成员都拒绝时把它原样回给客户端，
+	// 比自造的 "all members failed" 更能说明「是谁在拒什么」。
+	var lastPayload []byte
+	var lastHeader http.Header
+	var lastUpstreamError string
 	defer func() {
 		h.noteUsage(record.ID, lastProduct, lastOutcome)
 		entry := reqlog.Entry{
-			RequestID: requestID(), ClientIP: clientIP(r), UA: r.UserAgent(),
+			RequestID: requestID(), ClientRequestID: clientRequestID(r),
+			ClientIP: clientIP(r), UA: r.UserAgent(),
 			TokenID: record.ID, TokenName: record.Name, Group: groupName, Stream: false,
 			DurationMs: time.Since(started).Milliseconds(),
 			HTTPStatus: lastStatus, Outcome: string(lastOutcome),
 			TTFBMs: lastTTFB, Attempts: toReqlogAttempts(attempts),
 			PromptTokens: lastUsage.PromptTokens, CompletionTokens: lastUsage.CompletionTokens,
-			TotalTokens: lastUsage.TotalTokens,
+			TotalTokens:    lastUsage.TotalTokens,
+			CacheHitTokens: int64(lastUsage.CacheHitTokens),
+			CacheHitRate:   cacheHitRate(lastUsage.CacheHitTokens, lastUsage.PromptTokens),
+			Credit:         lastUsage.Credit,
+			UpstreamError:  lastUpstreamError,
+			CreditKnown:    lastUsage.HasCredit,
 		}
 		if len(attempts) > 0 {
 			last := attempts[len(attempts)-1]
 			entry.Product, entry.Model = last.Product, last.Model
 		}
 		h.writeLog(entry)
+		h.recordUsage(entry, lastUsage, lastOutcome == proxy.OutcomeOK)
 	}()
 
 	for i := 0; i < maxAttempts; i++ {
+		if clientGone(r) {
+			lastStatus, lastOutcome = statusClientClosed, proxy.OutcomeClientCanceled
+			writeError(w, statusClientClosed, "客户端已断开")
+			return
+		}
 		member, key, pickErr := h.pick(cfg, groupName, sessionKey, tried)
 		if pickErr != nil {
 			if errors.Is(pickErr, router.ErrGroupNotFound) {
@@ -172,7 +207,15 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ttfb := time.Since(started)
 		elapsed := ttfb.Milliseconds()
 		if callErr != nil {
-			h.fail(key, cfg.Routing.Cooldown, shortError(callErr))
+			// 客户端断开会让 r.Context() 取消：后续重试必然 0ms 失败，
+			// 且这不是上游故障，不能把成员打进冷却。
+			if clientGone(r) {
+				lastStatus, lastOutcome = statusClientClosed, proxy.OutcomeClientCanceled
+				attempts = append(attempts, Attempt{Product: member.Product, Model: member.Model, Status: 0, Code: string(lastOutcome), MS: elapsed})
+				writeError(w, statusClientClosed, "客户端已断开")
+				return
+			}
+			h.fail(key, transportCooldown(cfg.Routing.Cooldown, ttfb), shortError(callErr))
 			attempts = append(attempts, Attempt{Product: member.Product, Model: member.Model, Status: 0, Code: string(proxy.OutcomeUpstream), MS: elapsed})
 			lastStatus = http.StatusBadGateway
 			lastOutcome = proxy.OutcomeUpstream
@@ -206,18 +249,32 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if outcome == proxy.OutcomeClientError {
-			// 400 / 422 属请求本身有问题，换成员只会把所有下游打一遍。
+			// 400 / 422 不一定是请求本身错：不同上游对同一份请求的宽容度不同
+			// （例如 Gemini 兼容层会拒掉某些 OpenAI 字段），换成员仍可能成功。
 			payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 			response.Body.Close()
-			copyHeader(w.Header(), response.Header)
-			w.WriteHeader(response.StatusCode)
-			_, _ = w.Write(payload)
-			return
+			lastPayload, lastHeader = payload, response.Header.Clone()
+			lastUpstreamError = upstreamErrorSummary(payload)
+			// 额度耗尽 / 地区不支持 / 凭据无效：重试同一成员也没用，摘一段时间；
+			// 参数与 schema 不兼容则只降级，不把成员算成故障。
+			if unavailableClientError(lastUpstreamError) {
+				h.park(key, cfg.Routing.Cooldown.UnavailableDuration, "上游不可用（HTTP 400）")
+			} else if rule, ok := cfg.Routing.Cooldown.RuleFor(response.StatusCode); ok {
+				// 连续同状态码达到阈值：说明不是个别请求不兼容，而是协议/参数系统性变了，
+				// 继续每个请求都白撞一次只会拖慢全部流量。
+				h.countStatus(key, rule)
+			}
+			continue
 		}
 
 		_, _ = io.CopyN(io.Discard, response.Body, 512)
 		response.Body.Close()
 
+		// 其他状态码命中 status_rules 时同样走独立计数，不再叠加指数退避。
+		if rule, ok := cfg.Routing.Cooldown.RuleFor(response.StatusCode); ok {
+			h.countStatus(key, rule)
+			continue
+		}
 		// 401 / 403 是产品凭据问题：换产品仍可能成功，但不该冷却成员。
 		if outcome != proxy.OutcomeProductAuth {
 			h.fail(key, cfg.Routing.Cooldown, statusReason(outcome, response.StatusCode))
@@ -225,8 +282,17 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if lastStatus == 0 {
+		lastStatus = http.StatusServiceUnavailable
 		lastOutcome = proxy.Outcome("no_member")
 		writeError(w, http.StatusServiceUnavailable, "无可用成员")
+		return
+	}
+	// 最后一次尝试是「上游拒绝请求」：把它的响应原样回给客户端。
+	// 客户端能直接看到是哪个上游、拒了什么，比自造的 all members failed 更有用。
+	if lastOutcome == proxy.OutcomeClientError && len(lastPayload) > 0 {
+		copyHeader(w.Header(), lastHeader)
+		w.WriteHeader(lastStatus)
+		_, _ = w.Write(lastPayload)
 		return
 	}
 	// 不复制上游头：上游的 Content-Length / 压缩标记与这里的自有 JSON 不一致，会导致客户端截断。
@@ -240,17 +306,25 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) pick(cfg *config.Config, groupName, sessionKey string, tried map[string]struct{}) (config.Member, string, error) {
-	// rand.Rand 非并发安全：选路期间持锁；已完成失败计数的成员会被冷却过滤，不会重复命中。
+	// rand.Rand 非并发安全：选路期间持锁；已试成员由 PickExcluding 在候选阶段剔除，
+	// 冷却过期也不会重新选中，避免长超时后降级链被误判为「无可用成员」。
 	h.mu.Lock()
-	member, key, err := router.Pick(cfg, h.store.State(), groupName, sessionKey, h.rnd)
-	h.mu.Unlock()
-	if err != nil {
-		return config.Member{}, "", err
+	defer h.mu.Unlock()
+	return router.PickExcluding(cfg, h.store.State(), groupName, sessionKey, tried, h.rnd)
+}
+
+// transportCooldown 把传输层失败的实际耗时作为冷却基数下限。
+// 首包超时 30s 却只冷却 2s 时，成员会在下一次尝试结束前就复活，
+// 被反复选中并把并发请求一起打进冷却，表现为集中「无可用成员」。
+func transportCooldown(base config.Cooldown, elapsed time.Duration) config.Cooldown {
+	parsed, err := time.ParseDuration(base.Base)
+	if err != nil || parsed <= 0 {
+		parsed = 2 * time.Second
 	}
-	if _, seen := tried[key]; seen {
-		return config.Member{}, "", router.ErrNoMember
+	if elapsed > parsed {
+		base.Base = elapsed.String()
 	}
-	return member, key, nil
+	return base
 }
 
 func (h *Handler) writeLog(entry reqlog.Entry) {
@@ -258,6 +332,25 @@ func (h *Handler) writeLog(entry reqlog.Entry) {
 		return
 	}
 	h.logger.Write(entry)
+}
+
+// recordUsage 把一次请求计入用量累计器（面板「统计」页的数据源）。
+// 请求数与失败数按请求记；token 只在这次请求成功且上游确实回了 usage 时累加——
+// 失败请求身上的 usage 往往是上一次尝试的残留，记进去会把 token 统计打偏。
+// 耗时只对成功请求采样，所以面板上的「平均耗时」= 成功请求平均耗时。
+func (h *Handler) recordUsage(entry reqlog.Entry, result proxy.Usage, ok bool) {
+	if h.usage == nil {
+		return
+	}
+	delta := usage.Delta{LatencyMs: entry.DurationMs, HasLatency: ok}
+	if ok && result.Seen {
+		delta.Tokens = true
+		delta.PromptTokens = int64(result.PromptTokens)
+		delta.CompletionTokens = int64(result.CompletionTokens)
+		delta.TotalTokens = int64(result.TotalTokens)
+		delta.CacheHitTokens = int64(result.CacheHitTokens)
+	}
+	h.usage.Add(time.Now(), entry.Product, entry.Model, delta, ok)
 }
 
 // noteUsage 维护 Token 计数与产品健康摘要：请求热路径上只做内存写 + 脏标记。
@@ -268,9 +361,12 @@ func (h *Handler) noteUsage(tokenID, product string, outcome proxy.Outcome) {
 	state := h.store.State()
 	state.NoteTokenUse(tokenID)
 	if product != "" {
-		if outcome == proxy.OutcomeOK {
+		switch outcome {
+		case proxy.OutcomeOK:
 			state.NoteProductOK(product)
-		} else {
+		case proxy.OutcomeClientCanceled:
+			// 客户端断开与上游无关，不污染产品健康摘要。
+		default:
 			state.NoteProductError(product, string(outcome))
 		}
 	}
@@ -304,6 +400,52 @@ func shortError(err error) string {
 		text = text[:160]
 	}
 	return text
+}
+
+// upstreamErrorSummary 把上游 400/422 的响应压成一行摘要落进请求日志：
+// 排查「哪个上游挑剔什么参数」时不必再靠外部复现。只保留前 200 个字符。
+func upstreamErrorSummary(payload []byte) string {
+	const limit = 200
+	text := strings.Join(strings.Fields(string(payload)), " ")
+	runes := []rune(text)
+	if len(runes) > limit {
+		text = string(runes[:limit])
+	}
+	return text
+}
+
+// unavailableClientError 判断 400/422 是否属于「重试同一成员也没用」的情况：
+// 额度耗尽、地区不支持、凭据无效。其余（参数 / schema 不兼容）换成员仍可能成功。
+func unavailableClientError(summary string) bool {
+	text := strings.ToLower(summary)
+	for _, marker := range []string{
+		"quota", "rate limit", "rate_limit", "resource_exhausted", "resource exhausted",
+		"billing", "exceeded your current", "location is not supported",
+		"api key not valid", "invalid api key",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// park 把成员直接摘掉一段时间（不走指数退避、不累加失败计数），并落盘运行态。
+func (h *Handler) park(key, raw, reason string) {
+	duration, err := time.ParseDuration(raw)
+	if err != nil || duration <= 0 {
+		duration = 10 * time.Minute
+	}
+	h.store.State().SetCooldown(key, duration, reason)
+	h.store.MarkDirty()
+}
+
+// countStatus 按 status_rules 累加连续失败；达到阈值时把成员摘掉并落盘运行态。
+func (h *Handler) countStatus(key string, rule config.StatusRule) {
+	reason := "HTTP " + strconv.Itoa(rule.Status) + " 连续失败 " + strconv.Itoa(rule.Threshold) + " 次"
+	if h.store.State().CountStatus(key, rule, rule.RuleDuration(10*time.Minute), reason) {
+		h.store.MarkDirty()
+	}
 }
 
 // statusReason 给「上游返回非 2xx」一个可展示的原因。
@@ -378,6 +520,33 @@ func requestID() string {
 		return strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	return hex.EncodeToString(buf[:])
+}
+
+// clientRequestID 取客户端自带的请求 id，便于把网关日志与上下游日志对上。
+// 只认常见的几个头：客户端没带就留空，不自己编造（网关自己的 id 另有 request_id）。
+func clientRequestID(r *http.Request) string {
+	for _, name := range []string{"X-Request-Id", "X-Request-ID", "X-Trace-Id", "X-Correlation-Id", "Request-Id"} {
+		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
+			return clipText(value, 128)
+		}
+	}
+	return ""
+}
+
+// cacheHitRate 由命中 token 与 prompt token 推算；拿不到 prompt 时返回 0（字段省略不展示）。
+func cacheHitRate(hit, prompt int) float64 {
+	if hit <= 0 || prompt <= 0 || hit > prompt {
+		return 0
+	}
+	return float64(hit) / float64(prompt)
+}
+
+// clipText 裁到可读长度，避免超长头值撑爆日志行。
+func clipText(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit]
 }
 
 // clientIP 优先取反代写入的 X-Forwarded-For 首段，其次 RemoteAddr。

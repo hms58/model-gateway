@@ -11,10 +11,13 @@ import (
 
 	"model-gateway/internal/config"
 	"model-gateway/internal/pkg/catalog"
+	"model-gateway/internal/pkg/egress"
 	"model-gateway/internal/pkg/probe"
 	"model-gateway/internal/pkg/reqlog"
 	"model-gateway/internal/pkg/store"
+	"model-gateway/internal/pkg/usage"
 	"model-gateway/internal/router"
+	"model-gateway/internal/version"
 )
 
 // 管理面错误码：响应体里的 error.code，客户端据此区分失败原因。
@@ -39,6 +42,7 @@ type Server struct {
 	catalog      *catalog.Client
 	logsDir      string
 	logger       *reqlog.Logger
+	usage        *usage.Recorder
 }
 
 func New(st *store.Store, adminTokenSHA256 string) *Server {
@@ -64,7 +68,8 @@ func (s *Server) WithLogger(logger *reqlog.Logger) *Server {
 	return s
 }
 
-// Handler 返回管理面路由：`/api/modelgw/*` 需 admin_token，`/panel/*` 只提供静态页。
+// Handler 返回管理面路由：`/api/modelgw/*` 需 admin_token，
+// `/panel/*` 与 `/admin/*` 是同一套静态页的两个等价入口。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/api/modelgw/products", s.auth(http.HandlerFunc(s.products)))
@@ -74,14 +79,17 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/modelgw/catalog/fetch", s.auth(http.HandlerFunc(s.fetchModels)))
 	mux.Handle("/api/modelgw/models", s.auth(http.HandlerFunc(s.models)))
 	mux.Handle("/api/modelgw/models/refresh", s.auth(http.HandlerFunc(s.refreshModels)))
+	mux.Handle("/api/modelgw/models/toggle", s.auth(http.HandlerFunc(s.toggleModel)))
 	mux.Handle("/api/modelgw/settings", s.auth(http.HandlerFunc(s.settings)))
 	mux.Handle("/api/modelgw/tokens", s.auth(http.HandlerFunc(s.tokens)))
 	mux.Handle("/api/modelgw/tokens/", s.auth(http.HandlerFunc(s.tokenItem)))
 	mux.Handle("/api/modelgw/logs", s.auth(http.HandlerFunc(s.logsList)))
 	mux.Handle("/api/modelgw/logs/overview", s.auth(http.HandlerFunc(s.logsOverview)))
+	mux.Handle("/api/modelgw/usage", s.auth(http.HandlerFunc(s.usageSnapshot)))
 	mux.Handle("/api/modelgw/config/rollback", s.auth(http.HandlerFunc(s.rollback)))
 	mux.Handle("/api/modelgw/config/version", s.auth(http.HandlerFunc(s.version)))
 	mux.Handle("/panel/", s.staticHandler())
+	mux.Handle("/admin/", s.staticHandler())
 	return mux
 }
 
@@ -107,8 +115,10 @@ func (s *Server) products(w http.ResponseWriter, r *http.Request) {
 		views := make([]interface{}, 0, len(cfg.Products))
 		for _, product := range cfg.Products {
 			// 明文 key 不出本机：列表只回掩码，保存时按掩码识别“未修改”。
+			// 代理 URL 里的 userinfo 密码同理，不能从管理接口回显。
 			safe := product
 			safe.APIKey = maskAPIKey(product.APIKey)
+			safe.Proxy.URL = egress.MaskProxyURL(product.Proxy.URL)
 			views = append(views, struct {
 				config.Product
 				Health router.ProductState `json:"health"`
@@ -140,7 +150,7 @@ func (s *Server) products(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) saveProduct(product config.Product, version int) error {
-	cfg := *s.store.Snapshot()
+	cfg := s.store.Snapshot().Clone()
 	if strings.TrimSpace(product.ID) == "" {
 		return &apiError{http.StatusBadRequest, CodeInvalidParam, "产品 id 不能为空"}
 	}
@@ -151,6 +161,13 @@ func (s *Server) saveProduct(product config.Product, version int) error {
 			incoming := strings.TrimSpace(product.APIKey)
 			if incoming == "" || incoming == maskAPIKey(cfg.Products[i].APIKey) {
 				product.APIKey = cfg.Products[i].APIKey
+			}
+			// 代理密码同理：URL 与掩码一致说明用户没改密码，还原真实值。
+			// 与 api_key 一样，留空也表示「不改」；用户想停用代理应关 enabled，
+			// 而不是把 URL 清空后指望它变直连（旧地址会保留，便于再次启用）。
+			proxyURL := strings.TrimSpace(product.Proxy.URL)
+			if proxyURL == egress.MaskProxyURL(cfg.Products[i].Proxy.URL) {
+				product.Proxy.URL = cfg.Products[i].Proxy.URL
 			}
 			cfg.Products[i] = product
 			replaced = true
@@ -181,7 +198,7 @@ func (s *Server) productItem(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodDelete:
-		cfg := *s.store.Snapshot()
+		cfg := s.store.Snapshot().Clone()
 		for _, group := range cfg.ModelGroups {
 			for _, member := range group.Members {
 				if member.Product == id {
@@ -215,7 +232,7 @@ func (s *Server) productItem(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, CodeInvalidParam, err.Error())
 			return
 		}
-		cfg := *s.store.Snapshot()
+		cfg := s.store.Snapshot().Clone()
 		found := false
 		for i := range cfg.Products {
 			if cfg.Products[i].ID == id {
@@ -255,7 +272,7 @@ func (s *Server) groups(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, CodeInvalidParam, "group 字段不可解析")
 			return
 		}
-		cfg := *s.store.Snapshot()
+		cfg := s.store.Snapshot().Clone()
 		replaced := false
 		for i := range cfg.ModelGroups {
 			if cfg.ModelGroups[i].Name == group.Name {
@@ -294,8 +311,12 @@ func (s *Server) groupItem(w http.ResponseWriter, r *http.Request) {
 		s.sniffMember(w, r, strings.TrimSuffix(name, "/members/sniff"))
 		return
 	}
+	if strings.HasSuffix(name, "/members/sniff-all") {
+		s.sniffAllMembers(w, r, strings.TrimSuffix(name, "/members/sniff-all"))
+		return
+	}
 
-	cfg := *s.store.Snapshot()
+	cfg := s.store.Snapshot().Clone()
 	index := -1
 	for i := range cfg.ModelGroups {
 		if cfg.ModelGroups[i].Name == name {
@@ -469,6 +490,81 @@ func (s *Server) sniffMember(w http.ResponseWriter, r *http.Request, name string
 	})
 }
 
+// sniffAllMembers 一键嗅探：对本组所有异常成员串行探活，逐个发起、不并发。
+// 串行是刻意的：并发探活会把同一产品的上游瞬间打满，反而让探活自己超时失败。
+func (s *Server) sniffAllMembers(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidParam, "方法不支持")
+		return
+	}
+	cfg := s.store.Snapshot()
+	var group *config.Group
+	for i := range cfg.ModelGroups {
+		if cfg.ModelGroups[i].Name == name {
+			group = &cfg.ModelGroups[i]
+			break
+		}
+	}
+	if group == nil {
+		writeError(w, http.StatusNotFound, CodeGroupNotFound, "模型组不存在："+name)
+		return
+	}
+
+	products := make(map[string]config.Product, len(cfg.Products))
+	for _, item := range cfg.Products {
+		products[item.ID] = item
+	}
+	state := s.store.State()
+	now := time.Now().In(config.Location())
+
+	checked, recovered := 0, 0
+	results := make([]map[string]interface{}, 0, len(group.Members))
+	for _, member := range group.Members {
+		if !member.Enabled {
+			continue
+		}
+		// 只探异常成员：可用成员没有探测的必要，也避免一次点击打满上游。
+		status := state.StatusOf(config.MemberKey(name, member))
+		if status.State == "ok" && status.FailStreak == 0 {
+			continue
+		}
+		key := config.MemberKey(name, member)
+		row := map[string]interface{}{"product": member.Product, "model": member.Model}
+
+		product, ok := products[member.Product]
+		switch {
+		case !ok:
+			state.Probe(key, false, "产品已删除")
+			row["ok"], row["reason"] = false, "产品已删除"
+		case !product.Enabled:
+			state.Probe(key, false, "产品已停用")
+			row["ok"], row["reason"] = false, "产品已停用"
+		case !router.InWindow(member, now):
+			state.Probe(key, false, "不在生效时段")
+			row["ok"], row["reason"] = false, "不在生效时段"
+		default:
+			checked++
+			result := probe.Model(r.Context(), product, member.Model, 30*time.Second)
+			row["latency_ms"] = result.Latency.Milliseconds()
+			if !result.OK {
+				state.Probe(key, false, result.Reason)
+				row["ok"], row["reason"] = false, result.Reason
+			} else {
+				state.Probe(key, true, "")
+				recovered++
+				row["ok"] = true
+			}
+		}
+		results = append(results, row)
+	}
+	if len(results) > 0 {
+		s.store.MarkDirty()
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"checked": checked, "recovered": recovered, "data": results,
+	})
+}
+
 func clip(text string, limit int) string {
 	if len(text) <= limit {
 		return text
@@ -498,7 +594,7 @@ func (s *Server) moveMember(w http.ResponseWriter, r *http.Request, name string)
 		return
 	}
 
-	cfg := *s.store.Snapshot()
+	cfg := s.store.Snapshot().Clone()
 	index := -1
 	for i := range cfg.ModelGroups {
 		if cfg.ModelGroups[i].Name == name {
@@ -627,7 +723,21 @@ func (s *Server) fetchModels(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, CodeFetchModels, "拉取模型列表失败："+id)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"data": models})
+	// 停用的模型不进候选池：模型组编辑器的候选列表、手工输入的 datalist 都取这个接口，
+	// 在这一层过滤等于「哪儿都加不进去」，不用前端各写一遍。
+	writeJSON(w, http.StatusOK, map[string]interface{}{"data": enabledModels(target, models)})
+}
+
+// enabledModels 过滤掉被停用的模型 id，保持上游给的顺序。
+func enabledModels(product config.Product, models []string) []string {
+	out := make([]string, 0, len(models))
+	for _, id := range models {
+		if product.ModelDisabled(id) {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
@@ -643,7 +753,11 @@ func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{"version": s.store.Snapshot().Version})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"version": s.store.Snapshot().Version,
+		// build_version 是二进制自身的版本，与配置版本号无关。
+		"build_version": version.Version,
+	})
 }
 
 type apiError struct {

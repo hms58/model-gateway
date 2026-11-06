@@ -13,9 +13,13 @@ import (
 )
 
 // Entry 是一条请求日志；字段与方案 §4.6 对齐，按天落 JSONL。
+// 不落提示词、响应正文与任何凭据；ClientIP / UA 是调用来源，便于回答「这条请求是谁打进来的」。
 type Entry struct {
-	Time             string    `json:"time"`
-	RequestID        string    `json:"request_id,omitempty"`
+	Time      string `json:"time"`
+	RequestID string `json:"request_id,omitempty"`
+	// ClientRequestID 是客户端自己带的请求 id（X-Request-Id / X-Trace-Id 等），
+	// 便于把网关日志与上游或客户端日志对上；客户端没带就为空。
+	ClientRequestID  string    `json:"client_request_id,omitempty"`
 	TokenID          string    `json:"token_id,omitempty"`
 	TokenName        string    `json:"token_name,omitempty"`
 	Group            string    `json:"group"`
@@ -30,8 +34,18 @@ type Entry struct {
 	PromptTokens     int       `json:"prompt_tokens,omitempty"`
 	CompletionTokens int       `json:"completion_tokens,omitempty"`
 	TotalTokens      int       `json:"total_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UA               string    `json:"ua,omitempty"`
+	// CacheHitTokens 是上游前缀缓存命中的 prompt token 数，CacheHitRate 由它推算。
+	// 上游未提供该维度时两者省略（0 值），不要读成「命中率为 0」。
+	CacheHitTokens int64   `json:"cache_hit_tokens,omitempty"`
+	CacheHitRate   float64 `json:"cache_hit_rate,omitempty"`
+	// Credit 是本次消耗的积分；CreditKnown 区分「上游没给」与「消耗 0」。
+	Credit      float64 `json:"credit,omitempty"`
+	CreditKnown bool    `json:"credit_known,omitempty"`
+	// UpstreamError 是最后一次「上游拒绝请求」（400/422）的响应摘要，截断后落盘。
+	// 不同上游对同一份请求的宽容度不同，这条摘要用来回答「哪个上游在拒什么」。
+	UpstreamError string `json:"upstream_error,omitempty"`
+	ClientIP      string `json:"client_ip,omitempty"`
+	UA            string `json:"ua,omitempty"`
 }
 
 type Attempt struct {

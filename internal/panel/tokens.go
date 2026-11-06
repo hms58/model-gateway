@@ -82,7 +82,7 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 			Groups:    req.Groups,
 			CreatedAt: time.Now().In(config.Location()).Format(config.TimeLayout),
 		}
-		cfg := *s.store.Snapshot()
+		cfg := s.store.Snapshot().Clone()
 		cfg.Tokens = append(cfg.Tokens, record)
 		if err := s.store.Save(cfg, req.Version); err != nil {
 			writeSaveError(w, err)
@@ -104,7 +104,7 @@ func (s *Server) tokenItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := *s.store.Snapshot()
+	cfg := s.store.Snapshot().Clone()
 	index := -1
 	for i := range cfg.Tokens {
 		if cfg.Tokens[i].ID == id {

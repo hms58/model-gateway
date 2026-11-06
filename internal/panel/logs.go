@@ -16,8 +16,10 @@ import (
 )
 
 const (
-	defaultPageSize = 50
-	maxPageSize     = 200
+	// 默认与上限都是 100：日志按天扫全量文件后在内存里排序，
+	// 单页过大既拖慢面板，也失去分页意义。
+	defaultPageSize = 100
+	maxPageSize     = 100
 )
 
 // WithLogs 指定日志目录（为空时查询接口返回空集）。
@@ -49,10 +51,21 @@ func (s *Server) logsList(w http.ResponseWriter, r *http.Request) {
 	if page < 1 {
 		page = 1
 	}
-	if size < 1 || size > maxPageSize {
+	// 超上限时夹到上限而不是回落默认值：显式传 size=200 应拿到 100 条。
+	if size < 1 {
 		size = defaultPageSize
 	}
+	if size > maxPageSize {
+		size = maxPageSize
+	}
 	total := len(entries)
+	pages := 0
+	if total > 0 {
+		pages = (total + size - 1) / size
+	}
+	if pages > 0 && page > pages {
+		page = pages // 数据变少时把越界页夹回最后一页，避免返回空列表
+	}
 	start := (page - 1) * size
 	if start > total {
 		start = total
@@ -62,7 +75,8 @@ func (s *Server) logsList(w http.ResponseWriter, r *http.Request) {
 		end = total
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"total": total, "page": page, "size": size, "data": entries[start:end],
+		"total": total, "page": page, "size": size, "pages": pages,
+		"data": entries[start:end],
 	})
 }
 
@@ -204,6 +218,11 @@ func readEntries(path string) []reqlog.Entry {
 			continue
 		}
 		out = append(out, entry)
+	}
+	// 读文件途中出错（截断 / I/O 错误）不能当成「正常读完」：
+	// 保留已成功解析的部分，避免把残缺结果当作完整分页数据。
+	if err := scanner.Err(); err != nil {
+		return out
 	}
 	return out
 }

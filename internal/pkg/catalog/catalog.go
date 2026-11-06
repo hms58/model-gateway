@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"model-gateway/internal/config"
+	"model-gateway/internal/pkg/egress"
 )
 
 var ErrFetchFailed = errors.New("拉取下游模型列表失败")
@@ -34,10 +34,9 @@ type entry struct {
 // Client 缓存并持久化产品模型列表：
 // 内存缓存 → 文件缓存（未过期）→ 上游拉取；重启后优先用文件，过期或缺失才回源。
 type Client struct {
-	httpClient *http.Client
-	OKTTL      time.Duration
-	FailTTL    time.Duration
-	now        func() time.Time
+	OKTTL   time.Duration
+	FailTTL time.Duration
+	now     func() time.Time
 
 	mu   sync.Mutex
 	path string
@@ -53,13 +52,12 @@ func New() *Client {
 // NewWithFile 指定模型缓存的落盘文件；path 为空表示只走内存。
 func NewWithFile(path string) *Client {
 	client := &Client{
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		OKTTL:      10 * time.Minute,
-		FailTTL:    5 * time.Minute,
-		now:        time.Now,
-		path:       path,
-		file:       map[string]Entry{},
-		cache:      map[string]entry{},
+		OKTTL:   10 * time.Minute,
+		FailTTL: 5 * time.Minute,
+		now:     time.Now,
+		path:    path,
+		file:    map[string]Entry{},
+		cache:   map[string]entry{},
 	}
 	client.loadFile()
 	return client
@@ -214,14 +212,24 @@ func (c *Client) saveFile() {
 }
 
 func (c *Client) fetch(ctx context.Context, product config.Product) ([]string, error) {
-	url := strings.TrimRight(product.BaseURL, "/") + "/v1/models"
+	url := product.ModelsEndpoint()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+product.APIKey)
+	// 自定义头必须和转发/探活一致：某些中转要求额外鉴权头，
+	// 缺了会出现「聊天通、拉模型失败」这种很难排查的分裂行为。
+	for name, value := range product.Headers {
+		request.Header.Set(name, value)
+	}
 
-	response, err := c.httpClient.Do(request)
+	// 拉取模型目录也要走产品代理：否则「聊天通、面板拉不到模型」很难排查。
+	client, err := egress.Client(product, 5*time.Second, 30*time.Second, 30*time.Second, false)
+	if err != nil {
+		return nil, err
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, ErrFetchFailed
 	}

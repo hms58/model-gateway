@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math/rand"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -26,6 +27,9 @@ type MemberState struct {
 	LastError string `json:"last_error,omitempty"`
 	// ProbedAt 是最近一次主动嗅探的时间。
 	ProbedAt string `json:"probed_at,omitempty"`
+	// StatusStreaks 是按状态码的连续失败计数（key 为状态码），用于 status_rules 判定；
+	// 任何一次成功都会清空，避免「历史失败」把后来的偶发错误攒成冷却。
+	StatusStreaks map[string]int `json:"status_streaks,omitempty"`
 }
 
 type stickyEntry struct {
@@ -86,7 +90,7 @@ func (s *State) Load(saved Snapshot) {
 	defer s.mu.Unlock()
 	s.members = make(map[string]*MemberState, len(saved.Members))
 	for key, item := range saved.Members {
-		copied := item
+		copied := cloneMemberState(item)
 		s.members[key] = &copied
 	}
 	s.products = make(map[string]*ProductState, len(saved.Products))
@@ -111,7 +115,7 @@ func (s *State) Export() Snapshot {
 		Tokens:   make(map[string]TokenState, len(s.tokens)),
 	}
 	for key, item := range s.members {
-		out.Members[key] = *item
+		out.Members[key] = cloneMemberState(*item)
 	}
 	for key, item := range s.products {
 		out.Products[key] = *item
@@ -203,6 +207,7 @@ func (s *State) Success(key string) {
 	item.BreakerUntil = ""
 	item.LastOKAt = s.now().In(config.Location()).Format(config.TimeLayout)
 	item.LastError = ""
+	item.StatusStreaks = nil
 	delete(s.probes, key)
 }
 
@@ -271,6 +276,7 @@ func (s *State) Probe(key string, healthy bool, reason string) {
 	item.BreakerUntil = ""
 	item.LastOKAt = now
 	item.LastError = ""
+	item.StatusStreaks = nil
 	delete(s.probes, key)
 }
 
@@ -311,7 +317,50 @@ func (s *State) Failure(key string, cooldown config.Cooldown) {
 	item.CooldownUntil = now.Add(backoff).In(config.Location()).Format(config.TimeLayout)
 }
 
-// Available 判断成员是否参与选路；熔断到期后只放行一个探测。
+// SetCooldown 直接把成员摘到指定时刻，不累加失败计数。
+// 用于「上游明确不可用」这类重试也无用的错误（额度耗尽、地区不支持、凭据无效）：
+// 它们不代表成员响应能力下降，不该走指数退避，也不该攒成熔断。
+func (s *State) SetCooldown(key string, duration time.Duration, reason string) {
+	if key == "" || duration <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item := s.ensure(key)
+	item.CooldownUntil = s.now().Add(duration).In(config.Location()).Format(config.TimeLayout)
+	item.LastError = reason
+}
+
+// CountStatus 按状态码累加连续失败计数；达到阈值时把成员摘掉并清零该状态码计数。
+// 返回 true 表示本次已触发冷却。命中规则的错误不再叠加 fail_streak，
+// 这样「偶发同状态码」不会被指数退避提前放大成熔断。
+func (s *State) CountStatus(key string, rule config.StatusRule, duration time.Duration, reason string) bool {
+	if key == "" || rule.Threshold <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item := s.ensure(key)
+	if item.StatusStreaks == nil {
+		item.StatusStreaks = map[string]int{}
+	}
+	code := strconv.Itoa(rule.Status)
+	item.StatusStreaks[code]++
+	item.LastError = reason
+	if item.StatusStreaks[code] < rule.Threshold {
+		return false
+	}
+	delete(item.StatusStreaks, code)
+	if len(item.StatusStreaks) == 0 {
+		item.StatusStreaks = nil
+	}
+	item.CooldownUntil = s.now().Add(duration).In(config.Location()).Format(config.TimeLayout)
+	return true
+}
+
+// Available 纯读判断成员是否参与选路，不消耗半开探测名额。
+// 名额改由 ClaimProbe 在真正选中并准备转发时占用，避免选路阶段把
+// 所有到期成员的探测名额一次性用光，导致并发请求集体「无可用成员」。
 func (s *State) Available(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -324,14 +373,30 @@ func (s *State) Available(key string) bool {
 		return false
 	}
 	if until := parseTime(item.BreakerUntil); !until.IsZero() {
-		if until.After(now) {
+		if until.After(now) || s.probes[key] {
 			return false
 		}
-		if s.probes[key] {
-			return false
-		}
-		s.probes[key] = true
 	}
+	return true
+}
+
+// ClaimProbe 为熔断已到期的成员抢占半开探测名额，只对实际选中的成员调用。
+// 非半开成员不占名额；抢占失败说明名额已被其它请求拿走，应换下一个候选。
+func (s *State) ClaimProbe(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.members[key]
+	if !ok {
+		return true
+	}
+	until := parseTime(item.BreakerUntil)
+	if until.IsZero() || until.After(s.now()) {
+		return true
+	}
+	if s.probes[key] {
+		return false
+	}
+	s.probes[key] = true
 	return true
 }
 
@@ -357,6 +422,18 @@ func (s *State) stickyHit(sessionKey string) string {
 		return ""
 	}
 	return entry.key
+}
+
+// cloneMemberState 深拷贝可变字段：StatusStreaks 是 map，快照与运行态不能共享底层数组。
+func cloneMemberState(item MemberState) MemberState {
+	if item.StatusStreaks != nil {
+		streaks := make(map[string]int, len(item.StatusStreaks))
+		for code, count := range item.StatusStreaks {
+			streaks[code] = count
+		}
+		item.StatusStreaks = streaks
+	}
+	return item
 }
 
 func (s *State) ensure(key string) *MemberState {
@@ -390,16 +467,21 @@ func parseDuration(raw string, fallback time.Duration) time.Duration {
 	return parsed
 }
 
-// inWindow 判定闭区间：任一端为空表示该端不限制。
 // InWindow 判断成员在当前时间是否处于生效时段；面板与选路共用同一判定。
+// 「限时生效」（带日期的绝对区间）与「每日时段」同时开启时，两者都要命中。
 func InWindow(member config.Member, at time.Time) bool { return inWindow(member, at) }
 
 func inWindow(member config.Member, now time.Time) bool {
-	start, hasStart, err := config.ParseTime(member.Effective.Start)
+	return inDateWindow(member.Effective, now) && inDailyWindow(member.Daily, now)
+}
+
+// inDateWindow 判定绝对区间闭区间：任一端为空表示该端不限制。
+func inDateWindow(window config.Effective, now time.Time) bool {
+	start, hasStart, err := config.ParseTime(window.Start)
 	if err != nil {
 		return false
 	}
-	end, hasEnd, err := config.ParseTime(member.Effective.End)
+	end, hasEnd, err := config.ParseTime(window.End)
 	if err != nil {
 		return false
 	}
@@ -412,8 +494,45 @@ func inWindow(member config.Member, now time.Time) bool {
 	return true
 }
 
-// Pick 选出一个成员并返回其唯一键。
+// inDailyWindow 判定每天重复的时段：两端都空表示全天生效；
+// start 晚于 end 表示跨天（now >= start 或 now <= end），否则按同天闭区间判定。
+func inDailyWindow(window config.DailyWindow, now time.Time) bool {
+	start, hasStart, err := config.ParseClock(window.Start)
+	if err != nil {
+		return false
+	}
+	end, hasEnd, err := config.ParseClock(window.End)
+	if err != nil {
+		return false
+	}
+	if !hasStart && !hasEnd {
+		return true
+	}
+	local := now.In(config.Location())
+	second := local.Hour()*3600 + local.Minute()*60 + local.Second()
+	switch {
+	case hasStart && hasEnd && start > end:
+		return second >= start || second <= end
+	case hasStart && hasEnd:
+		return second >= start && second <= end
+	case hasStart:
+		return second >= start
+	default:
+		return second <= end
+	}
+}
+
+// Pick 选出一个成员并返回其唯一键；不需要排除已试成员时用它。
 func Pick(cfg *config.Config, st *State, groupName, sessionKey string, rnd *rand.Rand) (config.Member, string, error) {
+	return PickExcluding(cfg, st, groupName, sessionKey, nil, rnd)
+}
+
+// PickExcluding 在候选过滤阶段剔除本次请求已尝试过的成员。
+// 排除必须发生在选路内部：Pick 每次都返回权重最高的可用成员，若靠调用方
+// 「选完再判重」，冷却在长超时期间过期后已试成员会重新被选中，
+// 被误判成「无可用成员」而提前断掉整条降级链。
+func PickExcluding(cfg *config.Config, st *State, groupName, sessionKey string,
+	excluded map[string]struct{}, rnd *rand.Rand) (config.Member, string, error) {
 	if rnd == nil {
 		rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
@@ -453,6 +572,9 @@ func Pick(cfg *config.Config, st *State, groupName, sessionKey string, rnd *rand
 		if !st.Available(key) {
 			continue
 		}
+		if _, seen := excluded[key]; seen {
+			continue
+		}
 		candidates = append(candidates, member)
 	}
 	if len(candidates) == 0 {
@@ -462,9 +584,13 @@ func Pick(cfg *config.Config, st *State, groupName, sessionKey string, rnd *rand
 	if hit := st.stickyHit(sessionKey); hit != "" {
 		for _, member := range candidates {
 			key := config.MemberKey(groupName, member)
-			if key == hit {
+			if key != hit {
+				continue
+			}
+			if st.ClaimProbe(key) {
 				return member, key, nil
 			}
+			break
 		}
 	}
 
@@ -498,6 +624,12 @@ func Pick(cfg *config.Config, st *State, groupName, sessionKey string, rnd *rand
 		}
 	}
 
-	first := candidates[0]
-	return first, config.MemberKey(groupName, first), nil
+	// 只对真正选中的成员抢占半开名额：抢占失败就顺延到下一个候选。
+	for _, member := range candidates {
+		key := config.MemberKey(groupName, member)
+		if st.ClaimProbe(key) {
+			return member, key, nil
+		}
+	}
+	return config.Member{}, "", ErrNoMember
 }

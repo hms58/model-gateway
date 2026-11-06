@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"model-gateway/internal/config"
+	"model-gateway/internal/pkg/egress"
 )
 
 // Result 是一次模型探活的结果。
@@ -46,7 +47,7 @@ func Model(ctx context.Context, product config.Product, model string, timeout ti
 		return Result{Reason: "构造探活请求失败"}
 	}
 
-	url := strings.TrimRight(product.BaseURL, "/") + "/v1/chat/completions"
+	url := product.ChatEndpoint()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(payload)))
 	if err != nil {
 		return Result{Reason: "构造探活请求失败"}
@@ -57,7 +58,11 @@ func Model(ctx context.Context, product config.Product, model string, timeout ti
 		request.Header.Set(name, value)
 	}
 
-	client := &http.Client{Timeout: timeout}
+	// 探活必须和聊天转发走同一套代理，否则「配了代理的业务请求成功、嗅探却一直失败」。
+	client, err := egress.Client(product, 5*time.Second, timeout, timeout, false)
+	if err != nil {
+		return Result{Reason: clip(err.Error(), 160)}
+	}
 	started := time.Now()
 	response, err := client.Do(request)
 	latency := time.Since(started)

@@ -7,18 +7,25 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"model-gateway/internal/config"
 	"model-gateway/internal/pkg/store"
 )
 
-// newProber 造一个「一个产品 + 一个组 + 一个成员」的最小环境。
+// newProber 造一个「一个产品 + 一个组 + 一个成员」的最小环境（组级异步嗅探已开启）。
 func newProber(t *testing.T, upstream string, members []config.Member) (*Prober, *store.Store) {
+	t.Helper()
+	return newProberGroup(t, upstream, config.Group{Name: "gpt-5", Enabled: true, Probe: true, Members: members})
+}
+
+// newProberGroup 允许自定义整组（用来验证组级开关）。
+func newProberGroup(t *testing.T, upstream string, group config.Group) (*Prober, *store.Store) {
 	t.Helper()
 	cfg := config.Default()
 	cfg.Probe = config.Probe{Enabled: true, Interval: "1s", MinGap: "1s"}
 	cfg.Products = []config.Product{{ID: "workbuddy", Enabled: true, BaseURL: upstream, APIKey: "sk-test"}}
-	cfg.ModelGroups = []config.Group{{Name: "gpt-5", Enabled: true, Members: members}}
+	cfg.ModelGroups = []config.Group{group}
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "modelgw.json")
@@ -55,7 +62,7 @@ func TestProbeOnceRecoversBrokenMember(t *testing.T) {
 	defer upstream.Close()
 
 	prober, st := newProber(t, upstream.URL, []config.Member{
-		{Product: "workbuddy", Model: "gpt-5", Weight: 10, Enabled: true, Probe: true},
+		{Product: "workbuddy", Model: "gpt-5", Weight: 10, Enabled: true},
 	})
 	cfg := st.Snapshot()
 	key := config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[0])
@@ -82,7 +89,7 @@ func TestProbeOnceKeepsFailingMember(t *testing.T) {
 	defer upstream.Close()
 
 	prober, st := newProber(t, upstream.URL, []config.Member{
-		{Product: "workbuddy", Model: "gpt-5", Weight: 10, Enabled: true, Probe: true},
+		{Product: "workbuddy", Model: "gpt-5", Weight: 10, Enabled: true},
 	})
 	cfg := st.Snapshot()
 	key := config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[0])
@@ -100,14 +107,17 @@ func TestProbeOnceKeepsFailingMember(t *testing.T) {
 	}
 }
 
-// 未开启「异步嗅探」的成员不探；正常成员也不探。
-func TestProbeOnceSkipsDisabledSwitchAndHealthy(t *testing.T) {
+// 组级开关关闭 → 组内所有成员都不探（即便成员上残留旧版 probe=true）。
+func TestProbeOnceSkipsWhenGroupSwitchOff(t *testing.T) {
 	upstream := chatStub(t, true)
 	defer upstream.Close()
 
-	prober, st := newProber(t, upstream.URL, []config.Member{
-		{Product: "workbuddy", Model: "no-probe", Weight: 20, Enabled: true},
-		{Product: "workbuddy", Model: "healthy", Weight: 10, Enabled: true, Probe: true},
+	prober, st := newProberGroup(t, upstream.URL, config.Group{
+		Name: "gpt-5", Enabled: true, Probe: false,
+		Members: []config.Member{
+			// 存量配置里成员级 probe 可能还是 true，必须被组开关压过。
+			{Product: "workbuddy", Model: "gpt-5", Weight: 10, Enabled: true, Probe: true},
+		},
 	})
 	cfg := st.Snapshot()
 	key := config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[0])
@@ -117,7 +127,48 @@ func TestProbeOnceSkipsDisabledSwitchAndHealthy(t *testing.T) {
 	st.State().Failure(key, cooldown)
 
 	if checked, _ := prober.ProbeOnce(context.Background()); checked != 0 {
-		t.Fatalf("未开开关的异常成员与正常成员都不应探测，实际 %d", checked)
+		t.Fatalf("组开关关闭时不应探测任何成员，实际 %d", checked)
+	}
+}
+
+// 组开关开启后，组内所有异常成员都参与，不需要逐个成员标记。
+func TestProbeOnceCoversAllMembersWhenGroupSwitchOn(t *testing.T) {
+	upstream := chatStub(t, true)
+	defer upstream.Close()
+
+	prober, st := newProberGroup(t, upstream.URL, config.Group{
+		Name: "gpt-5", Enabled: true, Probe: true,
+		Members: []config.Member{
+			{Product: "workbuddy", Model: "m1", Weight: 20, Enabled: true},
+			{Product: "workbuddy", Model: "m2", Weight: 10, Enabled: true},
+		},
+	})
+	cfg := st.Snapshot()
+	cooldown := cfg.Routing.Cooldown
+	cooldown.FailThreshold = 1
+	cooldown.OpenDuration = "1s"
+	for _, member := range cfg.ModelGroups[0].Members {
+		st.State().Failure(config.MemberKey("gpt-5", member), cooldown)
+	}
+
+	// MinGap=1s 会在第二轮挡住同一产品；这里直接重置节流时间验证两个成员都能探。
+	prober.last = map[string]time.Time{}
+	checked, recovered := prober.ProbeOnce(context.Background())
+	if checked != 2 || recovered != 2 {
+		t.Fatalf("组开关开启应覆盖全部成员，实际 checked=%d recovered=%d", checked, recovered)
+	}
+}
+
+// 正常成员不探，避免无意义打下游。
+func TestProbeOnceSkipsHealthyMember(t *testing.T) {
+	upstream := chatStub(t, true)
+	defer upstream.Close()
+
+	prober, _ := newProber(t, upstream.URL, []config.Member{
+		{Product: "workbuddy", Model: "healthy", Weight: 10, Enabled: true},
+	})
+	if checked, _ := prober.ProbeOnce(context.Background()); checked != 0 {
+		t.Fatalf("正常成员不应探测，实际 %d", checked)
 	}
 }
 
@@ -127,7 +178,7 @@ func TestProbeOnceSkipsNotDueMember(t *testing.T) {
 	defer upstream.Close()
 
 	prober, st := newProber(t, upstream.URL, []config.Member{
-		{Product: "workbuddy", Model: "gpt-5", Weight: 10, Enabled: true, Probe: true},
+		{Product: "workbuddy", Model: "gpt-5", Weight: 10, Enabled: true},
 	})
 	cfg := st.Snapshot()
 	key := config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[0])

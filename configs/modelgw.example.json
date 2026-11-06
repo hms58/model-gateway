@@ -9,7 +9,12 @@
             "base": "2s",
             "max": "60s",
             "fail_threshold": 3,
-            "open_duration": "5m"
+            "open_duration": "5m",
+            "unavailable_duration": "10m",
+            "status_rules": [
+                { "status": 400, "threshold": 5, "duration": "60s" },
+                { "status": 502, "threshold": 3, "duration": "60s" }
+            ]
         },
         "prefer_last_ok": true,
         "sticky": {
@@ -41,6 +46,13 @@
                 "total": "300s"
             },
             "headers": {},
+            "chat_path": "/v1/chat/completions",
+            "models_path": "/v1/models",
+            "proxy": {
+                "enabled": false,
+                "url": ""
+            },
+            "disabled_models": [],
             "note": ""
         }
     ],
@@ -55,6 +67,10 @@
                     "weight": 100,
                     "enabled": true,
                     "effective": {
+                        "start": "",
+                        "end": ""
+                    },
+                    "daily": {
                         "start": "",
                         "end": ""
                     }

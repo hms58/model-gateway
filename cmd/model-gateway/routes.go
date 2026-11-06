@@ -13,7 +13,9 @@ func routes(gateway *dataplane.Handler, management http.Handler) http.Handler {
 	mux.HandleFunc("/healthz", gateway.Healthz)
 	mux.HandleFunc("/v1/chat/completions", gateway.ChatCompletions)
 	mux.HandleFunc("/v1/models", gateway.ListModels)
+	// /admin/ 与 /panel/ 是同一个管理面的等价入口。
 	mux.Handle("/panel/", management)
+	mux.Handle("/admin/", management)
 	mux.Handle("/api/modelgw/", management)
 	return mux
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"model-gateway/internal/config"
+	"model-gateway/internal/version"
 )
 
 // startupView 是「只有重启才生效」的启动参数。
@@ -41,6 +42,8 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 			"admin_token_set": strings.TrimSpace(cfg.AdminTokenSHA256) != "",
 			// 初始化模式：口令为空且请求来自本机，此时管理面免登录，但只允许本机。
 			"admin_bootstrap": s.unset(),
+			// 构建版本号：发布包由 ldflags 注入，本地构建为 dev。
+			"build_version": version.Version,
 			// 只读信息：让面板能说清「哪些项改了要重启」，以及当前进程实际用的值。
 			"restart_required": []string{"listen", "data_dir", "admin_token"},
 			"active_listen":    s.activeListen,
@@ -59,7 +62,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, CodeInvalidParam, msg)
 			return
 		}
-		cfg := *s.store.Snapshot()
+		cfg := s.store.Snapshot().Clone()
 		// 启动参数一律「留空即不修改」：只改选路/探活的调用方不会被顺手清掉监听地址。
 		if listen := strings.TrimSpace(req.Settings.Startup.Listen); listen != "" {
 			cfg.Listen = listen
@@ -71,7 +74,16 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 			cfg.AdminToken = ""
 			cfg.AdminTokenSHA256 = config.HashAdminToken(plain)
 		}
+		// 老前端或脚本可能不带这两项：缺省时沿用当前值，避免一次保存把它们顺手清掉。
+		cooldown := req.Settings.Routing.Cooldown
+		if strings.TrimSpace(cooldown.UnavailableDuration) == "" {
+			cooldown.UnavailableDuration = cfg.Routing.Cooldown.UnavailableDuration
+		}
+		if cooldown.StatusRules == nil {
+			cooldown.StatusRules = cfg.Routing.Cooldown.StatusRules
+		}
 		cfg.Routing = req.Settings.Routing
+		cfg.Routing.Cooldown = cooldown
 		cfg.Probe = req.Settings.Probe
 		cfg.Logging = req.Settings.Logging
 		if err := s.store.Save(cfg, req.Version); err != nil {
@@ -98,12 +110,13 @@ func validateSettings(view settingsView) string {
 		return "最大尝试次数必须 ≥ 1"
 	}
 	for name, raw := range map[string]string{
-		"cooldown.base":  view.Routing.Cooldown.Base,
-		"cooldown.max":   view.Routing.Cooldown.Max,
-		"open_duration":  view.Routing.Cooldown.OpenDuration,
-		"sticky.ttl":     view.Routing.Sticky.TTL,
-		"probe.interval": view.Probe.Interval,
-		"probe.min_gap":  view.Probe.MinGap,
+		"cooldown.base":        view.Routing.Cooldown.Base,
+		"cooldown.max":         view.Routing.Cooldown.Max,
+		"open_duration":        view.Routing.Cooldown.OpenDuration,
+		"unavailable_duration": view.Routing.Cooldown.UnavailableDuration,
+		"sticky.ttl":           view.Routing.Sticky.TTL,
+		"probe.interval":       view.Probe.Interval,
+		"probe.min_gap":        view.Probe.MinGap,
 	} {
 		if strings.TrimSpace(raw) == "" {
 			continue
@@ -116,6 +129,9 @@ func validateSettings(view settingsView) string {
 	if view.Routing.Cooldown.FailThreshold < 0 {
 		return "熔断阈值不能为负"
 	}
+	if msg := validateStatusRules(view.Routing.Cooldown.StatusRules); msg != "" {
+		return msg
+	}
 	if view.Probe.Enabled && strings.TrimSpace(view.Probe.Interval) != "" {
 		if value, err := time.ParseDuration(view.Probe.Interval); err == nil && value < 5*time.Second {
 			return "探活间隔不能小于 5s（避免打爆下游）"
@@ -126,6 +142,31 @@ func validateSettings(view settingsView) string {
 	}
 	if view.Logging.Dir == "" {
 		return "日志目录不能为空"
+	}
+	return ""
+}
+
+// validateStatusRules 校验「按状态码冷却」规则，口径与 config.validateStatusRules 一致，
+// 只是错误信息面向面板用户。
+func validateStatusRules(rules []config.StatusRule) string {
+	seen := make(map[int]struct{}, len(rules))
+	for _, rule := range rules {
+		if rule.Status < 100 || rule.Status > 599 {
+			return "按状态码冷却的状态码必须在 100-599 之间"
+		}
+		if _, dup := seen[rule.Status]; dup {
+			return "按状态码冷却的状态码不能重复"
+		}
+		seen[rule.Status] = struct{}{}
+		if rule.Threshold < 0 {
+			return "按状态码冷却的阈值不能为负"
+		}
+		if rule.Threshold == 0 {
+			continue
+		}
+		if value, err := time.ParseDuration(strings.TrimSpace(rule.Duration)); err != nil || value <= 0 {
+			return "按状态码冷却的时长不合法（示例 60s / 10m）"
+		}
 	}
 	return ""
 }

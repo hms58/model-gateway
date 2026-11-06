@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +23,8 @@ import (
 	"model-gateway/internal/pkg/prober"
 	"model-gateway/internal/pkg/reqlog"
 	"model-gateway/internal/pkg/store"
+	"model-gateway/internal/pkg/usage"
+	"model-gateway/internal/version"
 )
 
 func main() {
@@ -59,6 +62,11 @@ func run() error {
 	logger := reqlog.New(snapshot.Logging.Dir, snapshot.Logging.RetentionDays)
 	defer logger.Close()
 
+	// 用量累计器独立于请求日志：日志受保留期限制会删文件，这里折叠后长期保留。
+	usageRecorder := usage.New(filepath.Join(snapshot.DataDir, "usage.json"))
+	usageRecorder.Start()
+	defer usageRecorder.Stop()
+
 	stop := make(chan struct{})
 	go st.RunStateFlusher(stop, 5*time.Second)
 	go logger.RunCleanup(stop, 24*time.Hour)
@@ -68,10 +76,11 @@ func run() error {
 	// 前两者是明文入参，这里立刻转摘要，明文不进配置、不进日志。
 	adminSHA, adminSource := config.AdminTokenSHA256(*adminToken, snapshot.AdminTokenSHA256, nil)
 
-	gateway := dataplane.New(st).WithLogger(logger)
+	gateway := dataplane.New(st).WithLogger(logger).WithUsage(usageRecorder)
 	management := panel.New(st, adminSHA).
 		WithLogger(logger).
 		WithLogs(snapshot.Logging.Dir).
+		WithUsage(usageRecorder).
 		WithModelsPath(snapshot.DataDir).
 		Handler()
 
@@ -99,9 +108,9 @@ func run() error {
 		log.Printf("管理面口令来源：%s", adminSource)
 	}
 	log.Printf(
-		"model-gateway 启动：listen=%s config=%s 产品=%d 模型组=%d Token=%d dataDir=%s 日志=%s",
-		snapshot.Listen, resolved, len(snapshot.Products), len(snapshot.ModelGroups),
-		len(snapshot.Tokens), snapshot.DataDir, snapshot.Logging.Dir)
+		"model-gateway %s 启动：listen=%s config=%s 产品=%d 模型组=%d Token=%d dataDir=%s 日志=%s 用量=%s",
+		version.Version, snapshot.Listen, resolved, len(snapshot.Products), len(snapshot.ModelGroups),
+		len(snapshot.Tokens), snapshot.DataDir, snapshot.Logging.Dir, usageRecorder.Describe())
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()

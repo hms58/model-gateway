@@ -305,6 +305,155 @@ func TestPanelExposesFourViews(t *testing.T) {
 	}
 }
 
+// 请求日志必须展示来源与用量维度，且耗时按量级换单位（不再全是毫秒）。
+func TestPanelLogColumnsAndDurationUnits(t *testing.T) {
+	server, _ := newServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/panel/logs", nil)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	body := recorder.Body.String()
+
+	for _, want := range []string{
+		"function fmtMs", "value < 1000", "value < 60000", "' m'",
+		"function sourceText", "function cacheText", "function tokenText", "function creditText",
+		"<th>来源</th>", "<th>输入/输出</th>", "<th>缓存命中</th>", "<th>积分</th>",
+		"client_request_id", "cache_hit_rate", "credit_known",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("请求日志缺少 %q", want)
+		}
+	}
+}
+
+// 日志表 13 列：桌面必须横向滚动而不是压缩折行，移动端卡片必须让内容列可收缩。
+func TestPanelLogsTableDoesNotOverflow(t *testing.T) {
+	server, _ := newServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/panel/logs", nil)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	body := recorder.Body.String()
+
+	for _, want := range []string{
+		`<table class="wide">`, // 宽表标记
+		"table.wide > tbody > tr > td { white-space: nowrap; }",
+		"table.wide td.wrap",                                   // 允许换行的列（来源）
+		".dur { display: inline-flex; flex-direction: column;", // 耗时两行
+		"grid-template-columns: 62px minmax(0, 1fr);",          // 移动端内容列可收缩
+		"table.wide { min-width: 0; }",                         // 移动端取消宽表
+		"main { padding: 22px 28px 96px; width: 100%; }",       // 大屏铺满，不留右侧空白
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("日志表防溢出缺少 %q", want)
+		}
+	}
+	// 上一版制造「平白多出的滚动条 / 大屏右侧空白」的元凶，禁止回退。
+	for _, unwanted := range []string{"max-width: 1280px", "min-width: 1080px", "min-width: 1180px"} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("不应出现 %q：会人为撑宽表格或留白", unwanted)
+		}
+	}
+	// 耗时单元格必须用两行结构，不能再是内联「值 空格 首包」。
+	if strings.Contains(body, `'</span> <span class="muted">首包 '`) {
+		t.Fatal("耗时仍用内联拼接，窄列会被折成竖排")
+	}
+}
+
+// 日志分页控件与产品代理表单必须在面板里可见。
+func TestPanelLogPagerAndProductProxyForm(t *testing.T) {
+	server, _ := newServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/panel/logs", nil)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`id="log-pager"`, "function renderLogPager", "logPage = 1", "logSize = 100",
+		"size: String(logSize)", "page: String(logPage)",
+		`id="log-prev"`, `id="log-next"`, `id="log-size"`,
+		`id="f-proxy-enabled"`, `id="f-proxy-url"`, "socks5h",
+		"<th>代理</th>", "直连",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("面板缺少 %q", want)
+		}
+	}
+	if strings.Contains(body, "size: '50'") {
+		t.Fatal("日志查询不应再写死 50 条")
+	}
+}
+
+// 日志自动刷新必须是纯前端偏好：开关存 localStorage，5 秒一轮，默认关闭。
+func TestPanelLogAutoRefreshIsBrowserOnly(t *testing.T) {
+	server, _ := newServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/panel/logs", nil)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	body := recorder.Body.String()
+
+	for _, want := range []string{
+		`id="log-auto"`,
+		"modelgw_log_autorefresh",
+		"LOG_AUTO_MS = 5000",
+		"localStorage.setItem(LOG_AUTO_KEY",
+		"startLogAutoRefresh",
+		"stopLogAutoRefresh",
+		"自动刷新：关", // 默认关闭
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("日志自动刷新缺少 %q", want)
+		}
+	}
+	// 不能把开关写进后端配置：配置页与配置接口都不该出现这个键。
+	if strings.Contains(body, "settings.log_auto") || strings.Contains(body, "log_auto_refresh") {
+		t.Fatal("自动刷新开关不应进入后端配置")
+	}
+}
+
+// 尝试链路必须带具体模型：同一产品下的多个模型才能区分是哪次降级。
+func TestPanelAttemptChainIncludesModel(t *testing.T) {
+	server, _ := newServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/panel/logs", nil)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	for _, want := range []string{"function attemptChain", "const who", "a.model"} {
+		if !strings.Contains(recorder.Body.String(), want) {
+			t.Fatalf("尝试链路缺少 %q", want)
+		}
+	}
+}
+
+// /panel/ 与 /admin/ 是同一套静态页的两个等价入口。
+func TestPanelAndAdminAreEquivalentEntrances(t *testing.T) {
+	server, _ := newServer(t)
+	handler := server.Handler()
+
+	for _, prefix := range []string{"/panel", "/admin"} {
+		for _, suffix := range []string{"/", "/logs", "/settings"} {
+			path := prefix + suffix
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("%s 应返回 200，实际 %d", path, recorder.Code)
+			}
+			if !strings.Contains(recorder.Body.String(), "<!doctype html>") {
+				t.Fatalf("%s 应返回 SPA 入口", path)
+			}
+			if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("%s 的 HTML 应不缓存，实际 %q", path, got)
+			}
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/logs", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	for _, want := range []string{"const basePath", "startsWith('/admin')", "basePath + '/settings'"} {
+		if !strings.Contains(recorder.Body.String(), want) {
+			t.Fatalf("面板缺少等价入口支持 %q", want)
+		}
+	}
+}
+
 func TestPanelSpaFallbackAndEmbeddable(t *testing.T) {
 	server, _ := newServer(t)
 	handler := server.Handler()
@@ -412,6 +561,245 @@ func TestLogsListFiltersAndPaginates(t *testing.T) {
 	byKeyword := call(t, handler, http.MethodGet, "/api/modelgw/logs?q=脚本", nil)
 	if !strings.Contains(byKeyword.Body.String(), `"total":1`) {
 		t.Fatalf("关键字过滤应命中 1 条：%s", byKeyword.Body.String())
+	}
+}
+
+// 分页默认与上限都是 100，且返回总页数；越界页夹回最后一页。
+func TestLogsListDefaultAndMaxPageSize(t *testing.T) {
+	server, _ := newServer(t)
+	dir := t.TempDir()
+	day := time.Now().In(config.Location()).Format("20060102")
+	var builder strings.Builder
+	for i := 0; i < 205; i++ {
+		builder.WriteString(`{"time":"2026-11-05 00:01:00","group":"gpt-5","outcome":"ok","http_status":200}` + "\n")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "requests-"+day+".jsonl"), []byte(builder.String()), 0o644); err != nil {
+		t.Fatalf("准备日志失败：%v", err)
+	}
+	handler := server.WithLogs(dir).Handler()
+
+	decode := func(path string) map[string]interface{} {
+		recorder := call(t, handler, http.MethodGet, path, nil)
+		var payload map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s 响应不是合法 JSON：%v", path, err)
+		}
+		return payload
+	}
+	assertInt := func(payload map[string]interface{}, key string, want float64, path string) {
+		if got, _ := payload[key].(float64); got != want {
+			t.Fatalf("%s 的 %s 应为 %v，实际 %v（%v）", path, key, want, got, payload[key])
+		}
+	}
+
+	defaultPage := decode("/api/modelgw/logs")
+	assertInt(defaultPage, "size", 100, "默认查询")
+	assertInt(defaultPage, "total", 205, "默认查询")
+	assertInt(defaultPage, "pages", 3, "默认查询")
+	if got := len(defaultPage["data"].([]interface{})); got != 100 {
+		t.Fatalf("默认每页应返回 100 条，实际 %d", got)
+	}
+
+	capped := decode("/api/modelgw/logs?size=500")
+	assertInt(capped, "size", 100, "超限 size")
+	if got := len(capped["data"].([]interface{})); got != 100 {
+		t.Fatalf("size 超上限应夹到 100 条，实际 %d", got)
+	}
+
+	last := decode("/api/modelgw/logs?page=3")
+	assertInt(last, "page", 3, "第 3 页")
+	if got := len(last["data"].([]interface{})); got != 5 {
+		t.Fatalf("最后一页应有 5 条，实际 %d", got)
+	}
+
+	clamped := decode("/api/modelgw/logs?page=99")
+	assertInt(clamped, "page", 3, "越界页")
+	if got := len(clamped["data"].([]interface{})); got != 5 {
+		t.Fatalf("越界页应夹回最后一页并返回 5 条，实际 %d", got)
+	}
+}
+
+// 产品可配置端点路径：面板要能填、能存，非法值保存时拦下。
+func TestProductEndpointPaths(t *testing.T) {
+	server, st := newServer(t)
+	handler := server.Handler()
+
+	product := map[string]interface{}{
+		"id": "gemini", "enabled": true, "api_key": "g-key",
+		"base_url":    "https://generativelanguage.googleapis.com/v1beta/openai",
+		"chat_path":   "/chat/completions",
+		"models_path": "/models",
+	}
+	saved := call(t, handler, http.MethodPost, "/api/modelgw/products",
+		map[string]interface{}{"version": st.Snapshot().Version, "product": product})
+	if saved.Code != http.StatusOK {
+		t.Fatalf("保存自定义端点失败：%d %s", saved.Code, saved.Body.String())
+	}
+	find := func(id string) config.Product {
+		for _, item := range st.Snapshot().Products {
+			if item.ID == id {
+				return item
+			}
+		}
+		t.Fatalf("找不到产品 %s", id)
+		return config.Product{}
+	}
+	got := find("gemini")
+	if got.ChatPath != "/chat/completions" || got.ModelsPath != "/models" {
+		t.Fatalf("端点路径未落盘：%+v", got)
+	}
+	if want := "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"; got.ChatEndpoint() != want {
+		t.Fatalf("chat 端点拼接错误：%q", got.ChatEndpoint())
+	}
+
+	// 完整 URL 会让 base_url + path 拼出不可请求的地址，必须在保存时拦住。
+	bad := map[string]interface{}{
+		"id": "gemini", "enabled": true, "base_url": "https://x.example",
+		"chat_path": "https://evil.example/v1/chat/completions",
+	}
+	if recorder := call(t, handler, http.MethodPost, "/api/modelgw/products",
+		map[string]interface{}{"version": st.Snapshot().Version, "product": bad}); recorder.Code == http.StatusOK {
+		t.Fatal("完整 URL 作为 chat_path 不应保存成功")
+	}
+	// 校验失败不能污染已保存的配置。
+	if after := find("gemini"); after.ChatPath != "/chat/completions" {
+		t.Fatalf("校验失败不应改动配置：%+v", after)
+	}
+}
+
+// 保存被校验拒绝时，内存里的运行配置必须保持不变。
+// Snapshot() 返回共享底层数组，浅拷贝 + 原地赋值会把非法值写进运行态：
+// 磁盘没变、路由却立刻用了坏配置，重启后又"自愈"，非常难查。
+func TestRejectedSaveDoesNotPolluteSnapshot(t *testing.T) {
+	server, st := newServer(t)
+	handler := server.Handler()
+	before := st.Snapshot()
+	originalBase := before.Products[0].BaseURL
+	originalVersion := before.Version
+
+	bad := map[string]interface{}{
+		"id": before.Products[0].ID, "enabled": true,
+		"base_url":  "https://changed.example",
+		"chat_path": "https://evil.example/v1/chat/completions", // 非法：完整 URL
+	}
+	recorder := call(t, handler, http.MethodPost, "/api/modelgw/products",
+		map[string]interface{}{"version": originalVersion, "product": bad})
+	if recorder.Code == http.StatusOK {
+		t.Fatal("非法 chat_path 不应保存成功")
+	}
+
+	after := st.Snapshot()
+	if after.Products[0].BaseURL != originalBase {
+		t.Fatalf("被拒绝的保存污染了 base_url：%q -> %q", originalBase, after.Products[0].BaseURL)
+	}
+	if after.Products[0].ChatPath != "" {
+		t.Fatalf("被拒绝的保存污染了 chat_path：%q", after.Products[0].ChatPath)
+	}
+	if after.Version != originalVersion {
+		t.Fatalf("被拒绝的保存改动了配置版本：%d -> %d", originalVersion, after.Version)
+	}
+}
+
+// Clone 必须真的隔离底层数组与 map，否则「先改后校验」仍会写穿快照。
+func TestConfigCloneIsDeep(t *testing.T) {
+	original := config.Default()
+	original.Products = []config.Product{{
+		ID: "p", Headers: map[string]string{"X-A": "1"},
+	}}
+	original.ModelGroups = []config.Group{{
+		Name: "g", Members: []config.Member{{Product: "p", Model: "m"}},
+	}}
+	original.Tokens = []config.Token{{ID: "t", Groups: []string{"g"}}}
+
+	clone := original.Clone()
+	clone.Products[0].Headers["X-A"] = "changed"
+	clone.Products[0].ID = "other"
+	clone.ModelGroups[0].Members[0].Model = "changed"
+	clone.Tokens[0].Groups[0] = "changed"
+
+	if original.Products[0].Headers["X-A"] != "1" {
+		t.Fatal("Headers map 未被深拷贝")
+	}
+	if original.Products[0].ID != "p" {
+		t.Fatal("Products slice 未被深拷贝")
+	}
+	if original.ModelGroups[0].Members[0].Model != "m" {
+		t.Fatal("Members slice 未被深拷贝")
+	}
+	if original.Tokens[0].Groups[0] != "g" {
+		t.Fatal("Token.Groups 未被深拷贝")
+	}
+}
+
+// 面板表单必须提供两个端点输入框，并带上 Gemini 兼容层示例。
+func TestPanelProductEndpointForm(t *testing.T) {
+	server, _ := newServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/panel/products", nil)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`id="f-chat-path"`, `id="f-models-path"`,
+		`placeholder="/v1/chat/completions"`, `placeholder="/v1/models"`,
+		"chat_path:", "models_path:", "v1beta/openai",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("产品表单缺少 %q", want)
+		}
+	}
+}
+
+// 产品代理设置：保存后按产品生效，密码不回显，掩码回填时保留真实值。
+func TestProductProxySaveAndMask(t *testing.T) {
+	server, st := newServer(t)
+	handler := server.Handler()
+	const rawURL = "socks5://user:secret@127.0.0.1:1080"
+
+	product := map[string]interface{}{
+		"id": "workbuddy", "enabled": true, "base_url": "http://127.0.0.1:7863",
+		"api_key": "sk-test",
+		"proxy":   map[string]interface{}{"enabled": true, "url": rawURL},
+	}
+	saved := call(t, handler, http.MethodPost, "/api/modelgw/products",
+		map[string]interface{}{"version": st.Snapshot().Version, "product": product})
+	if saved.Code != http.StatusOK {
+		t.Fatalf("保存代理失败：%d %s", saved.Code, saved.Body.String())
+	}
+	if got := st.Snapshot().Products[0].Proxy; !got.Enabled || got.URL != rawURL {
+		t.Fatalf("代理配置未落盘：%+v", got)
+	}
+
+	listed := call(t, handler, http.MethodGet, "/api/modelgw/products", nil)
+	if strings.Contains(listed.Body.String(), "secret") {
+		t.Fatalf("产品列表不得回显代理密码：%s", listed.Body.String())
+	}
+	if !strings.Contains(listed.Body.String(), "********") {
+		t.Fatalf("产品列表应回显代理密码掩码：%s", listed.Body.String())
+	}
+
+	// 面板原样回填掩码 → 必须保留真实密码，不能被掩码覆盖。
+	echo := map[string]interface{}{
+		"id": "workbuddy", "enabled": true, "base_url": "http://127.0.0.1:7863",
+		"api_key": "sk-test",
+		"proxy":   map[string]interface{}{"enabled": true, "url": "socks5://user:********@127.0.0.1:1080"},
+	}
+	if recorder := call(t, handler, http.MethodPost, "/api/modelgw/products",
+		map[string]interface{}{"version": st.Snapshot().Version, "product": echo}); recorder.Code != http.StatusOK {
+		t.Fatalf("掩码回填保存失败：%d %s", recorder.Code, recorder.Body.String())
+	}
+	if got := st.Snapshot().Products[0].Proxy.URL; got != rawURL {
+		t.Fatalf("掩码回填应保留真实代理 URL，实际 %q", got)
+	}
+
+	// 非法代理协议要在保存时拦下，不等到真实请求才失败。
+	invalid := map[string]interface{}{
+		"id": "workbuddy", "enabled": true, "base_url": "http://127.0.0.1:7863",
+		"proxy": map[string]interface{}{"enabled": true, "url": "ftp://127.0.0.1:21"},
+	}
+	bad := call(t, handler, http.MethodPost, "/api/modelgw/products",
+		map[string]interface{}{"version": st.Snapshot().Version, "product": invalid})
+	if bad.Code == http.StatusOK {
+		t.Fatal("非法代理协议不应保存成功")
 	}
 }
 
@@ -641,6 +1029,139 @@ func TestMemberStatusAndSniff(t *testing.T) {
 	}
 }
 
+// 一键嗅探：只探异常成员、串行执行，返回每个成员的结果。
+func TestSniffAllMembersCoversOnlyBrokenOnes(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "gpt-5") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("{\"code\":11102,\"msg\":\"model not available\"}"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"))
+	}))
+	defer upstream.Close()
+
+	server, st := newServer(t)
+	cfg := *st.Snapshot()
+	cfg.Products[0].BaseURL = upstream.URL
+	cfg.Products[0].APIKey = "sk-test"
+	cfg.ModelGroups[0].Members = []config.Member{
+		{Product: "workbuddy", Model: "gpt-5", Weight: 100, Enabled: true},
+		{Product: "workbuddy", Model: "gpt-4o", Weight: 10, Enabled: true},
+		{Product: "workbuddy", Model: "gpt-4o-mini", Weight: 5, Enabled: false},
+	}
+	if err := st.Save(cfg, cfg.Version); err != nil {
+		t.Fatalf("准备配置失败：%v", err)
+	}
+	cooldown := cfg.Routing.Cooldown
+	st.State().Failure(config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[0]), cooldown)
+	st.State().Failure(config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[1]), cooldown)
+
+	recorder := call(t, server.Handler(), http.MethodPost,
+		"/api/modelgw/model-groups/gpt-5/members/sniff-all",
+		map[string]interface{}{"version": st.Snapshot().Version})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("一键嗅探失败：%d %s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Checked   int `json:"checked"`
+		Recovered int `json:"recovered"`
+		Data      []struct {
+			Model  string `json:"model"`
+			OK     bool   `json:"ok"`
+			Reason string `json:"reason"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	if payload.Checked != 2 || len(payload.Data) != 2 {
+		t.Fatalf("应只探 2 个异常成员，实际 checked=%d data=%+v", payload.Checked, payload.Data)
+	}
+	if payload.Recovered != 1 {
+		t.Fatalf("gpt-5 应恢复、gpt-4o 应仍失败，实际 recovered=%d：%+v", payload.Recovered, payload.Data)
+	}
+	for _, row := range payload.Data {
+		if row.Model == "gpt-4o-mini" {
+			t.Fatalf("停用成员不应被探测：%+v", row)
+		}
+		if row.Model == "gpt-4o" && (row.OK || !strings.Contains(row.Reason, "404")) {
+			t.Fatalf("仍失败的成员应带回原因：%+v", row)
+		}
+	}
+	if got := st.State().StatusOf(config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[0])); got.State != "ok" || got.FailStreak != 0 {
+		t.Fatalf("嗅探成功应清掉冷却：%+v", got)
+	}
+}
+
+// 一键嗅探必须串行：并发会把同一产品上游瞬间打满，反而让探活自己超时。
+// 用「每个请求固定耗时」的上游断言总耗时接近 n*delay，而不是约等于 delay。
+func TestSniffAllMembersRunsSerially(t *testing.T) {
+	const delay = 120 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(delay)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"))
+	}))
+	defer upstream.Close()
+
+	server, st := newServer(t)
+	cfg := *st.Snapshot()
+	cfg.Products[0].BaseURL = upstream.URL
+	cfg.Products[0].APIKey = "sk-test"
+	cfg.ModelGroups[0].Members = []config.Member{
+		{Product: "workbuddy", Model: "m1", Weight: 100, Enabled: true},
+		{Product: "workbuddy", Model: "m2", Weight: 90, Enabled: true},
+		{Product: "workbuddy", Model: "m3", Weight: 80, Enabled: true},
+	}
+	if err := st.Save(cfg, cfg.Version); err != nil {
+		t.Fatalf("准备配置失败：%v", err)
+	}
+	cooldown := cfg.Routing.Cooldown
+	for _, member := range cfg.ModelGroups[0].Members {
+		st.State().Failure(config.MemberKey("gpt-5", member), cooldown)
+	}
+
+	started := time.Now()
+	recorder := call(t, server.Handler(), http.MethodPost,
+		"/api/modelgw/model-groups/gpt-5/members/sniff-all",
+		map[string]interface{}{"version": st.Snapshot().Version})
+	elapsed := time.Since(started)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("一键嗅探失败：%d %s", recorder.Code, recorder.Body.String())
+	}
+	if elapsed < 3*delay {
+		t.Fatalf("3 个成员应串行探测（>=%v），实际 %v（并发会快得多）", 3*delay, elapsed)
+	}
+	if !strings.Contains(recorder.Body.String(), `"recovered":3`) {
+		t.Fatalf("3 个成员都应恢复：%s", recorder.Body.String())
+	}
+}
+
+// 组级异步嗅探开关：保存后应按组生效，成员级 probe 不再参与判定。
+func TestGroupProbeSwitchIsGroupScoped(t *testing.T) {
+	server, st := newServer(t)
+	group := map[string]interface{}{
+		"name": "gpt-5", "enabled": true, "probe": true,
+		"members": []map[string]interface{}{
+			{"product": "workbuddy", "model": "gpt-5", "weight": 100, "enabled": true, "probe": false},
+		},
+	}
+	if recorder := call(t, server.Handler(), http.MethodPost, "/api/modelgw/model-groups",
+		map[string]interface{}{"version": st.Snapshot().Version, "group": group}); recorder.Code != http.StatusOK {
+		t.Fatalf("保存失败：%d %s", recorder.Code, recorder.Body.String())
+	}
+	after := st.Snapshot()
+	if !after.ModelGroups[0].Probe {
+		t.Fatal("组级 probe 开关未落盘")
+	}
+	if after.ModelGroups[0].Members[0].Probe {
+		t.Fatal("成员级 probe 不应被写入")
+	}
+}
+
 // 模型列表页要有数据与更新时间；配置页要能读改通用参数。
 func TestModelsListAndSettings(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -718,8 +1239,10 @@ func settingsPayload(st *store.Store, mutate func(map[string]interface{})) map[s
 			"max_attempts": cfg.Routing.MaxAttempts, "prefer_last_ok": cfg.Routing.PreferLastOK,
 			"cooldown": map[string]interface{}{
 				"base": cfg.Routing.Cooldown.Base, "max": cfg.Routing.Cooldown.Max,
-				"fail_threshold": cfg.Routing.Cooldown.FailThreshold,
-				"open_duration":  cfg.Routing.Cooldown.OpenDuration,
+				"fail_threshold":       cfg.Routing.Cooldown.FailThreshold,
+				"open_duration":        cfg.Routing.Cooldown.OpenDuration,
+				"unavailable_duration": cfg.Routing.Cooldown.UnavailableDuration,
+				"status_rules":         cfg.Routing.Cooldown.StatusRules,
 			},
 			"sticky": map[string]interface{}{"enabled": cfg.Routing.Sticky.Enabled, "ttl": cfg.Routing.Sticky.TTL},
 		},
@@ -734,6 +1257,67 @@ func settingsPayload(st *store.Store, mutate func(map[string]interface{})) map[s
 		mutate(settings)
 	}
 	return map[string]interface{}{"version": cfg.Version, "settings": settings}
+}
+
+// 「额度类 400 冷却」与「按状态码冷却」在配置页可改，且保存后能读回。
+func TestSettingsSaveStatusRules(t *testing.T) {
+	server, st := newServer(t)
+	payload := settingsPayload(st, func(settings map[string]interface{}) {
+		routing := settings["routing"].(map[string]interface{})
+		cooldown := routing["cooldown"].(map[string]interface{})
+		cooldown["unavailable_duration"] = "15m"
+		cooldown["status_rules"] = []map[string]interface{}{
+			{"status": 400, "threshold": 3, "duration": "30s"},
+			{"status": 429, "threshold": 1, "duration": "10s"},
+		}
+	})
+	recorder := call(t, server.Handler(), http.MethodPost, "/api/modelgw/settings", payload)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("保存按状态码冷却失败：%d %s", recorder.Code, recorder.Body.String())
+	}
+
+	after := st.Snapshot().Routing.Cooldown
+	if after.UnavailableDuration != "15m" {
+		t.Fatalf("额度类冷却时长未保存：%+v", after)
+	}
+	if len(after.StatusRules) != 2 {
+		t.Fatalf("规则条数不对：%+v", after.StatusRules)
+	}
+	if after.StatusRules[0].Status != 400 || after.StatusRules[0].Threshold != 3 || after.StatusRules[0].Duration != "30s" {
+		t.Fatalf("规则内容不对：%+v", after.StatusRules[0])
+	}
+}
+
+// 老前端或脚本提交的 payload 不含这两项：保存时沿用当前值，不能顺手清掉。
+func TestSettingsKeepsStatusRulesWhenOmitted(t *testing.T) {
+	server, st := newServer(t)
+
+	seed := settingsPayload(st, func(settings map[string]interface{}) {
+		routing := settings["routing"].(map[string]interface{})
+		cooldown := routing["cooldown"].(map[string]interface{})
+		cooldown["unavailable_duration"] = "20m"
+		cooldown["status_rules"] = []map[string]interface{}{{"status": 400, "threshold": 4, "duration": "45s"}}
+	})
+	if recorder := call(t, server.Handler(), http.MethodPost, "/api/modelgw/settings", seed); recorder.Code != http.StatusOK {
+		t.Fatalf("预置规则失败：%d %s", recorder.Code, recorder.Body.String())
+	}
+
+	// 模拟老前端：把两个新字段整段删掉再提交。
+	payload := settingsPayload(st, nil)
+	cooldown := payload["settings"].(map[string]interface{})["routing"].(map[string]interface{})["cooldown"].(map[string]interface{})
+	delete(cooldown, "unavailable_duration")
+	delete(cooldown, "status_rules")
+	if recorder := call(t, server.Handler(), http.MethodPost, "/api/modelgw/settings", payload); recorder.Code != http.StatusOK {
+		t.Fatalf("保存失败：%d %s", recorder.Code, recorder.Body.String())
+	}
+
+	after := st.Snapshot().Routing.Cooldown
+	if after.UnavailableDuration != "20m" {
+		t.Fatalf("缺省字段不应被清空：%+v", after)
+	}
+	if len(after.StatusRules) != 1 || after.StatusRules[0].Threshold != 4 {
+		t.Fatalf("缺省字段不应被清空：%+v", after.StatusRules)
+	}
 }
 
 // 监听地址 / 数据目录 / 管理口令都在配置页可改，但只在下次启动生效：

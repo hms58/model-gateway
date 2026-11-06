@@ -3,26 +3,25 @@ package proxy
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"model-gateway/internal/config"
+	"model-gateway/internal/pkg/egress"
 )
 
 // Outcome 是请求日志与降级判定共用的结果分类。
 type Outcome string
 
 const (
-	OutcomeOK          Outcome = "ok"
-	OutcomeClientError Outcome = "client_error"
-	OutcomeProductAuth Outcome = "product_auth"
-	OutcomeQuota       Outcome = "quota"
-	OutcomeUpstream    Outcome = "upstream"
+	OutcomeOK             Outcome = "ok"
+	OutcomeClientError    Outcome = "client_error"
+	OutcomeProductAuth    Outcome = "product_auth"
+	OutcomeQuota          Outcome = "quota"
+	OutcomeUpstream       Outcome = "upstream"
+	OutcomeClientCanceled Outcome = "client_canceled"
 )
 
 // Classify 把下游状态码映射成分类；换不换成员由调用方按分类决定。
@@ -64,11 +63,9 @@ type Response struct {
 	Duration time.Duration
 }
 
-// Forwarder 按产品超时构建并复用 http.Client：平台默认 30s 超时会掐断长请求，
-// 首包超时才是降级依据（见 config.Product.Timeout）。
-type Forwarder struct {
-	clients sync.Map // 超时指纹 -> *http.Client
-}
+// Forwarder 按产品超时与代理构建并复用 http.Client（缓存由 egress 统一持有）：
+// 平台默认 30s 超时会掐断长请求，首包超时才是降级依据（见 config.Product.Timeout）。
+type Forwarder struct{}
 
 func NewForwarder() *Forwarder { return &Forwarder{} }
 
@@ -85,27 +82,14 @@ func parseDuration(raw string, fallback time.Duration) time.Duration {
 
 // clientFor 按产品超时取 client：流式不设总超时（否则长流被截断），
 // 非流式用 total 兜底；connect 与首包超时由 Transport 承担。
-func (f *Forwarder) clientFor(product config.Product, streaming bool) *http.Client {
+func (f *Forwarder) clientFor(product config.Product, streaming bool) (*http.Client, error) {
 	connect := parseDuration(product.Timeout.Connect, 5*time.Second)
 	firstByte := parseDuration(product.Timeout.FirstByte, 30*time.Second)
 	total := time.Duration(0)
 	if !streaming {
 		total = parseDuration(product.Timeout.Total, 300*time.Second)
 	}
-	key := fmt.Sprintf("%s|%s|%s|%s|%t", product.ID, connect, firstByte, total, streaming)
-	if cached, ok := f.clients.Load(key); ok {
-		return cached.(*http.Client)
-	}
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext:           (&net.Dialer{Timeout: connect}).DialContext,
-			ResponseHeaderTimeout: firstByte,
-			MaxIdleConnsPerHost:   32,
-		},
-		Timeout: total,
-	}
-	actual, _ := f.clients.LoadOrStore(key, client)
-	return actual.(*http.Client)
+	return egress.Client(product, connect, firstByte, total, streaming)
 }
 
 // Do 发起一次非流式转发并把响应体读全（供测试与需要完整 body 的调用方）；

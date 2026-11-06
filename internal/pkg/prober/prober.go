@@ -80,12 +80,12 @@ func (p *Prober) ProbeOnce(ctx context.Context) (checked, recovered int) {
 		if !group.Enabled {
 			continue
 		}
+		// 默认关闭：按组开关，开了就组内所有成员都参与，避免无谓的真实请求。
+		if !group.Probe {
+			continue
+		}
 		for _, member := range group.Members {
 			if !member.Enabled {
-				continue
-			}
-			// 默认关闭：只有成员上显式开启「异步嗅探」才参与，避免无谓的真实请求。
-			if !member.Probe {
 				continue
 			}
 			product, ok := products[member.Product]

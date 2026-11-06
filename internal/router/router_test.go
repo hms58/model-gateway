@@ -204,3 +204,226 @@ func TestPickRejectsUnknownGroup(t *testing.T) {
 		t.Fatalf("期望 ErrGroupNotFound，实际 %v", err)
 	}
 }
+
+func TestPickExcludingSkipsTriedMembers(t *testing.T) {
+	cfg := baseCfg()
+	cfg.ModelGroups = []config.Group{{
+		Name: "gpt-5", Enabled: true,
+		Members: []config.Member{
+			{Product: "workbuddy", Model: "primary", Weight: 100, Enabled: true},
+			{Product: "workbuddy", Model: "second", Weight: 90, Enabled: true},
+			{Product: "trae", Model: "third", Weight: 80, Enabled: true},
+		},
+	}}
+	st := NewState(nil)
+	first, firstKey, err := Pick(cfg, st, "gpt-5", "", nil)
+	if err != nil {
+		t.Fatalf("首次选路失败：%v", err)
+	}
+	second, secondKey, err := PickExcluding(cfg, st, "gpt-5", "", map[string]struct{}{firstKey: {}}, nil)
+	if err != nil {
+		t.Fatalf("排除已试成员后应仍有候选：%v", err)
+	}
+	if first.Model != "primary" || second.Model != "second" {
+		t.Fatalf("降级顺序错误：%s -> %s", first.Model, second.Model)
+	}
+	if secondKey == firstKey {
+		t.Fatal("已试成员不应被重新选中")
+	}
+}
+
+// 30s 首包超时只配 2s 冷却时，已试成员会在下一次选路前复活；
+// 排除必须在候选阶段生效，否则降级链会被误判为「无可用成员」。
+func TestPickExcludingAfterCooldownExpires(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Routing.Cooldown = config.Cooldown{Base: "2s", Max: "60s", FailThreshold: 3, OpenDuration: "5m"}
+	cfg.ModelGroups = []config.Group{{
+		Name: "gpt-5", Enabled: true,
+		Members: []config.Member{
+			{Product: "workbuddy", Model: "primary", Weight: 100, Enabled: true},
+			{Product: "workbuddy", Model: "second", Weight: 90, Enabled: true},
+		},
+	}}
+	now := mustParse(t, "2026-11-06 06:00:00")
+	st := NewState(func() time.Time { return now })
+	_, firstKey, err := Pick(cfg, st, "gpt-5", "", nil)
+	if err != nil {
+		t.Fatalf("首次选路失败：%v", err)
+	}
+	st.Failure(firstKey, cfg.Routing.Cooldown)
+	now = now.Add(30 * time.Second)
+	if _, _, err := Pick(cfg, st, "gpt-5", "", nil); err != nil {
+		t.Fatalf("冷却过期后成员应重新可用：%v", err)
+	}
+	member, _, err := PickExcluding(cfg, st, "gpt-5", "", map[string]struct{}{firstKey: {}}, nil)
+	if err != nil {
+		t.Fatalf("冷却复活不应打断降级链：%v", err)
+	}
+	if member.Model != "second" {
+		t.Fatalf("应降级到下一个成员，实际 %s", member.Model)
+	}
+}
+
+// Available 是纯读：选路评估全部候选时不能把半开探测名额用光。
+func TestAvailableDoesNotConsumeProbeSlot(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Routing.Cooldown = config.Cooldown{Base: "2s", Max: "60s", FailThreshold: 1, OpenDuration: "1s"}
+	members := []config.Member{{Product: "workbuddy", Model: "primary", Weight: 100, Enabled: true}}
+	cfg.ModelGroups = []config.Group{{Name: "gpt-5", Enabled: true, Members: members}}
+	now := mustParse(t, "2026-11-06 06:00:00")
+	st := NewState(func() time.Time { return now })
+	key := config.MemberKey("gpt-5", members[0])
+	st.Failure(key, cfg.Routing.Cooldown)
+	now = now.Add(2 * time.Second)
+	for i := 0; i < 3; i++ {
+		if !st.Available(key) {
+			t.Fatal("Available 纯读，重复调用不应消耗探测名额")
+		}
+	}
+	if !st.ClaimProbe(key) {
+		t.Fatal("首个 ClaimProbe 应抢到半开名额")
+	}
+	if st.ClaimProbe(key) {
+		t.Fatal("半开名额只能被占用一次")
+	}
+	if st.Available(key) {
+		t.Fatal("名额占用后成员应不再参与选路")
+	}
+}
+
+// 每日时段跨天：23:00-07:00 表示当天 23:00 到次日 07:00，两端闭区间。
+func TestPickDailyWindowCrossDay(t *testing.T) {
+	tests := []struct {
+		name string
+		now  string
+		want bool
+	}{
+		{"早于起点一秒", "2026-11-05 22:59:59", false},
+		{"恰好起点", "2026-11-05 23:00:00", true},
+		{"当天深夜", "2026-11-05 23:59:59", true},
+		{"次日凌晨", "2026-11-06 03:00:00", true},
+		{"恰好终点", "2026-11-06 07:00:00", true},
+		{"晚于终点一秒", "2026-11-06 07:00:01", false},
+		{"次日中午", "2026-11-06 12:00:00", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseCfg()
+			cfg.ModelGroups = []config.Group{{
+				Name: "gpt-5", Enabled: true,
+				Members: []config.Member{{
+					Product: "workbuddy", Model: "gpt-5", Weight: 100, Enabled: true,
+					Daily: config.DailyWindow{Start: "23:00", End: "07:00"},
+				}},
+			}}
+			now := mustParse(t, tc.now)
+			st := NewState(func() time.Time { return now })
+			_, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1)))
+			if tc.want && err != nil {
+				t.Fatalf("时段内应可选中：%v", err)
+			}
+			if !tc.want && !errors.Is(err, ErrNoMember) {
+				t.Fatalf("时段外应无候选，实际 %v", err)
+			}
+		})
+	}
+}
+
+// 每日时段同天：09:00-18:00 只在当天这个区间内生效。
+func TestPickDailyWindowSameDay(t *testing.T) {
+	tests := []struct {
+		name string
+		now  string
+		want bool
+	}{
+		{"早于起点一秒", "2026-11-06 08:59:59", false},
+		{"恰好起点", "2026-11-06 09:00:00", true},
+		{"区间内", "2026-11-06 12:00:00", true},
+		{"恰好终点", "2026-11-06 18:00:00", true},
+		{"晚于终点一秒", "2026-11-06 18:00:01", false},
+		{"次日区间内", "2026-11-07 12:00:00", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseCfg()
+			cfg.ModelGroups = []config.Group{{
+				Name: "gpt-5", Enabled: true,
+				Members: []config.Member{{
+					Product: "workbuddy", Model: "gpt-5", Weight: 100, Enabled: true,
+					Daily: config.DailyWindow{Start: "09:00:00", End: "18:00:00"},
+				}},
+			}}
+			now := mustParse(t, tc.now)
+			st := NewState(func() time.Time { return now })
+			_, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1)))
+			if tc.want && err != nil {
+				t.Fatalf("时段内应可选中：%v", err)
+			}
+			if !tc.want && !errors.Is(err, ErrNoMember) {
+				t.Fatalf("时段外应无候选，实际 %v", err)
+			}
+		})
+	}
+}
+
+// 「限时生效」与每日时段同时开启：两者都命中才生效。
+func TestPickRequiresBothWindows(t *testing.T) {
+	tests := []struct {
+		name string
+		now  string
+		want bool
+	}{
+		{"日期区间内且每日时段内", "2026-11-06 23:30:00", true},
+		{"日期区间内但每日时段外", "2026-11-06 12:00:00", false},
+		{"每日时段内但日期区间外", "2026-11-10 23:30:00", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseCfg()
+			cfg.ModelGroups = []config.Group{{
+				Name: "gpt-5", Enabled: true,
+				Members: []config.Member{{
+					Product: "workbuddy", Model: "gpt-5", Weight: 100, Enabled: true,
+					Effective: config.Effective{Start: "2026-11-01 00:00:00", End: "2026-11-08 23:59:59"},
+					Daily:     config.DailyWindow{Start: "23:00", End: "07:00"},
+				}},
+			}}
+			now := mustParse(t, tc.now)
+			st := NewState(func() time.Time { return now })
+			_, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1)))
+			if tc.want && err != nil {
+				t.Fatalf("两个时段都命中应可选中：%v", err)
+			}
+			if !tc.want && !errors.Is(err, ErrNoMember) {
+				t.Fatalf("任一时段未命中都应无候选，实际 %v", err)
+			}
+		})
+	}
+}
+
+// 按状态码计数：达到阈值才冷却；一次成功清零，避免历史失败攒成冷却。
+func TestCountStatusCoolsAtThresholdAndResetsOnSuccess(t *testing.T) {
+	now := mustParse(t, "2026-11-15 12:00:00")
+	st := NewState(func() time.Time { return now })
+	rule := config.StatusRule{Status: 400, Threshold: 2, Duration: "60s"}
+	key := "gpt-5|workbuddy|m"
+
+	if st.CountStatus(key, rule, time.Minute, "HTTP 400") {
+		t.Fatal("首次失败不应冷却")
+	}
+	if !st.CountStatus(key, rule, time.Minute, "HTTP 400") {
+		t.Fatal("达到阈值应冷却")
+	}
+	if st.Snapshot(key).CooldownUntil == "" {
+		t.Fatal("应写入冷却时间")
+	}
+	if st.Available(key) {
+		t.Fatal("冷却期内不应参与选路")
+	}
+
+	st.Success(key)
+	snap := st.Snapshot(key)
+	if snap.StatusStreaks != nil || snap.CooldownUntil != "" {
+		t.Fatalf("成功应清空连续计数与冷却：%+v", snap)
+	}
+}

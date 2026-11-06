@@ -74,6 +74,73 @@ func (f *flushRecorder) Write(p []byte) (int, error) {
 func (f *flushRecorder) WriteHeader(code int) { f.code = code }
 func (f *flushRecorder) Flush()               { f.flushes++ }
 
+// 缓存命中与积分要从各上游的不同字段名里取到，且不能被后续空分片覆盖。
+func TestStreamCopyExtractsCacheHitAndCredit(t *testing.T) {
+	tests := []struct {
+		name       string
+		line       string
+		wantHit    int
+		wantCredit float64
+		wantKnown  bool
+	}{
+		{
+			name:    "prompt_tokens_details.cached_tokens（主流形态）",
+			line:    `data: {"usage":{"prompt_tokens":8500,"completion_tokens":5,"total_tokens":8505,"prompt_tokens_details":{"cached_tokens":8400},"credit":0.12}}`,
+			wantHit: 8400, wantCredit: 0.12, wantKnown: true,
+		},
+		{
+			name:    "prompt_cache_hit_tokens（workbuddy 形态）",
+			line:    `data: {"usage":{"prompt_tokens":1000,"prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":100,"credit":0.1}}`,
+			wantHit: 900, wantCredit: 0.1, wantKnown: true,
+		},
+		{
+			name:    "真实值优先于 0 兼容别名",
+			line:    `data: {"usage":{"prompt_tokens":21000,"cached_tokens":0,"cache_read_input_tokens":0,"prompt_tokens_details":{"cached_tokens":20864}}}`,
+			wantHit: 20864, wantKnown: false,
+		},
+		{
+			name:    "无缓存维度也不无中生有",
+			line:    `data: {"usage":{"prompt_tokens":100,"completion_tokens":2,"total_tokens":102}}`,
+			wantHit: 0, wantKnown: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := &flushRecorder{header: http.Header{}}
+			usage, err := StreamCopy(recorder, strings.NewReader(tc.line+"\n\n"), recorder)
+			if err != nil {
+				t.Fatalf("流式拷贝失败：%v", err)
+			}
+			if usage.CacheHitTokens != tc.wantHit {
+				t.Fatalf("命中 token 应为 %d，实际 %d", tc.wantHit, usage.CacheHitTokens)
+			}
+			if usage.HasCredit != tc.wantKnown {
+				t.Fatalf("积分是否可知应为 %v，实际 %v", tc.wantKnown, usage.HasCredit)
+			}
+			if tc.wantKnown && usage.Credit != tc.wantCredit {
+				t.Fatalf("积分应为 %v，实际 %v", tc.wantCredit, usage.Credit)
+			}
+		})
+	}
+}
+
+// 流式末帧常只带 usage 的一小部分：已取到的值不能被空分片冲掉。
+func TestStreamCopyKeepsUsageAcrossChunks(t *testing.T) {
+	recorder := &flushRecorder{header: http.Header{}}
+	stream := `data: {"usage":{"prompt_tokens":5000,"prompt_tokens_details":{"cached_tokens":4800}}}` + "\n\n" +
+		`data: {"usage":{"completion_tokens":120,"total_tokens":5120}}` + "\n\n"
+	usage, err := StreamCopy(recorder, strings.NewReader(stream), recorder)
+	if err != nil {
+		t.Fatalf("流式拷贝失败：%v", err)
+	}
+	if usage.PromptTokens != 5000 || usage.CacheHitTokens != 4800 {
+		t.Fatalf("前一分片的 prompt/命中值被冲掉：%+v", usage)
+	}
+	if usage.CompletionTokens != 120 || usage.TotalTokens != 5120 {
+		t.Fatalf("后一分片的补值未合并：%+v", usage)
+	}
+}
+
 func TestStreamCopyFlushesPerChunk(t *testing.T) {
 	recorder := &flushRecorder{header: http.Header{}}
 	usage, err := StreamCopy(recorder,

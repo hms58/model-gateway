@@ -26,7 +26,13 @@ func (s *Server) staticHandler() http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/panel")
+		// /panel 与 /admin 是等价前缀：剥掉后按同一套静态资源解析。
+		path := r.URL.Path
+		if strings.HasPrefix(path, "/panel") {
+			path = path[len("/panel"):]
+		} else if strings.HasPrefix(path, "/admin") {
+			path = path[len("/admin"):]
+		}
 		if path == "" || path == "/" || !exists(sub, path) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-store")
