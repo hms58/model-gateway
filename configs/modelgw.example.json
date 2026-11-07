@@ -38,6 +38,7 @@
             "name": "上游 A",
             "protocol": "openai-chat",
             "base_url": "http://127.0.0.1:8000",
+            "console_url": "http://127.0.0.1:8000/admin",
             "api_key": "sk-****",
             "enabled": true,
             "timeout": {

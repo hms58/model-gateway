@@ -85,14 +85,17 @@ const (
 )
 
 type Product struct {
-	ID       string            `json:"id"`
-	Name     string            `json:"name"`
-	Protocol string            `json:"protocol"`
-	BaseURL  string            `json:"base_url"`
-	APIKey   string            `json:"api_key"`
-	Enabled  bool              `json:"enabled"`
-	Timeout  Timeout           `json:"timeout"`
-	Headers  map[string]string `json:"headers"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	BaseURL  string `json:"base_url"`
+	// ConsoleURL 是该产品自己的管理后台地址（例如 http://127.0.0.1:7863/admin）。
+	// 只供面板「点产品名跳过去」用，不参与转发、探活与目录拉取；留空表示产品名不可点。
+	ConsoleURL string            `json:"console_url,omitempty"`
+	APIKey     string            `json:"api_key"`
+	Enabled    bool              `json:"enabled"`
+	Timeout    Timeout           `json:"timeout"`
+	Headers    map[string]string `json:"headers"`
 	// ChatPath / ModelsPath 覆盖默认端点路径，用于非标准 OpenAI 兼容端点：
 	// Gemini 兼容层是 /v1beta/openai/chat/completions（没有 /v1 段），
 	// Azure 是 /openai/deployments/<d>/chat/completions?api-version=...。
@@ -178,6 +181,28 @@ func ValidateEndpointPath(field, path string) error {
 	}
 	if !strings.HasPrefix(trimmed, "/") {
 		return fmt.Errorf("%s 必须以 / 开头", field)
+	}
+	return nil
+}
+
+// ValidateConsoleURL 校验产品后台地址：留空表示不配置。
+// 只放行 http/https：面板会把它原样渲染成链接，javascript:、data: 之类的 scheme 不能进配置。
+func ValidateConsoleURL(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("console_url 不可解析：%w", err)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return fmt.Errorf("console_url 只支持 http/https，当前 scheme 为 %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return errors.New("console_url 缺少主机名")
 	}
 	return nil
 }
@@ -511,6 +536,10 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("产品 %s：%w", p.ID, err)
 		}
 		if err := ValidateEndpointPath("models_path", p.ModelsPath); err != nil {
+			return fmt.Errorf("产品 %s：%w", p.ID, err)
+		}
+		// 产品后台地址会被面板渲染成可点击链接，非法 scheme 等到点开才暴露，保存时就拦住。
+		if err := ValidateConsoleURL(p.ConsoleURL); err != nil {
 			return fmt.Errorf("产品 %s：%w", p.ID, err)
 		}
 		products[p.ID] = p

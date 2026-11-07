@@ -203,6 +203,45 @@ func TestSaveProductBumpsVersion(t *testing.T) {
 	}
 }
 
+// 产品后台地址只用于面板跳转：保存后要原样回显，非法 scheme 要在保存时拦下（不能被渲染成链接）。
+func TestProductConsoleURLRoundTrip(t *testing.T) {
+	server, st := newServer(t)
+	handler := server.Handler()
+	const target = "http://127.0.0.1:7863/admin"
+
+	saved := call(t, handler, http.MethodPost, "/api/modelgw/products", map[string]interface{}{
+		"version": st.Snapshot().Version,
+		"product": map[string]interface{}{
+			"id": "workbuddy", "enabled": true, "base_url": "http://127.0.0.1:7863",
+			"console_url": target,
+		},
+	})
+	if saved.Code != http.StatusOK {
+		t.Fatalf("保存后台地址失败：%d %s", saved.Code, saved.Body.String())
+	}
+	if got := st.Snapshot().Products[0].ConsoleURL; got != target {
+		t.Fatalf("后台地址未落盘：%q", got)
+	}
+	listed := call(t, handler, http.MethodGet, "/api/modelgw/products", nil)
+	if !strings.Contains(listed.Body.String(), `"console_url":"`+target+`"`) {
+		t.Fatalf("产品列表应回显后台地址：%s", listed.Body.String())
+	}
+
+	bad := call(t, handler, http.MethodPost, "/api/modelgw/products", map[string]interface{}{
+		"version": st.Snapshot().Version,
+		"product": map[string]interface{}{
+			"id": "workbuddy", "enabled": true, "base_url": "http://127.0.0.1:7863",
+			"console_url": "javascript:alert(1)",
+		},
+	})
+	if bad.Code == http.StatusOK {
+		t.Fatal("javascript: 作为后台地址不应保存成功")
+	}
+	if got := st.Snapshot().Products[0].ConsoleURL; got != target {
+		t.Fatalf("校验失败不应改动已保存的后台地址：%q", got)
+	}
+}
+
 func TestSaveProductStaleVersionReturns409(t *testing.T) {
 	server, _ := newServer(t)
 	recorder := call(t, server.Handler(), http.MethodPost, "/api/modelgw/products", map[string]interface{}{

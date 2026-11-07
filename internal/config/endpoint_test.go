@@ -109,3 +109,42 @@ func TestConfigRejectsInvalidEndpointPath(t *testing.T) {
 		t.Fatalf("Gemini 兼容层配置应合法：%v", err)
 	}
 }
+
+// 产品后台地址只放行 http/https 绝对地址：面板会把它原样渲染成可点击链接。
+func TestValidateConsoleURL(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		ok   bool
+	}{
+		{"留空表示不配置", "", true},
+		{"纯空白视为不配置", "   ", true},
+		{"http", "http://127.0.0.1:7863/admin", true},
+		{"https 带查询串", "https://console.example.com/p/x?tab=1", true},
+		{"缺 scheme", "127.0.0.1:7863/admin", false},
+		{"javascript scheme", "javascript:alert(1)", false},
+		{"file scheme", "file:///tmp/x", false},
+		{"只有 scheme 没有主机", "http://", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateConsoleURL(tc.url)
+			if (err == nil) != tc.ok {
+				t.Fatalf("%q 期望 ok=%v，实际 err=%v", tc.url, tc.ok, err)
+			}
+		})
+	}
+}
+
+func TestConfigRejectsInvalidConsoleURL(t *testing.T) {
+	cfg := validConfig()
+	cfg.Products[0].ConsoleURL = "javascript:alert(1)"
+	if err := Validate(&cfg); err == nil {
+		t.Fatal("javascript: 作为 console_url 应校验失败")
+	}
+
+	cfg = validConfig()
+	cfg.Products[0].ConsoleURL = "http://127.0.0.1:7863/admin"
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("合法的 console_url 应能保存：%v", err)
+	}
+}

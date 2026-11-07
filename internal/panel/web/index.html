@@ -228,6 +228,9 @@
     /* ---------- 产品 / Token 单元格 ---------- */
     .cell-id { display: flex; flex-direction: column; gap: 1px; }
     .cell-id small { color: var(--muted); font-size: 11.5px; }
+    /* 配了后台地址的产品名是链接：颜色沿用全局 a，这里只去掉下划线，悬停再给。 */
+    .cell-id a.id { color: var(--accent); text-decoration: none; }
+    .cell-id a.id:hover { text-decoration: underline; }
     .health { display: flex; flex-direction: column; gap: 3px; }
     .health .when { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
 
@@ -429,11 +432,14 @@
     }
     .chart .col { flex: 1 1 0; min-width: 26px; display: flex; flex-direction: column; gap: 4px; }
     .chart .val { font-size: 10.5px; color: var(--ink-2); text-align: center; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .chart .bar { height: 150px; display: flex; flex-direction: column; justify-content: flex-end; gap: 1px; }
-    .chart .bar i { display: block; border-radius: 2px; }
-    .chart .bar i.p { background: #b9c6ef; }
-    .chart .bar i.c { background: var(--accent); }
-    .chart .bar i.none { height: 2px; background: var(--line); }
+    /* 绘图区的类名不能复用 .bar：工具栏也用 .bar，其 align-items:center 会作用到
+       column 布局的柱体容器上，把没有内容的柱段横向压成 0 宽，整条柱子就看不见了。
+       柱段用 flex:0 0 auto 固定 JS 算出的像素高度，避免容器高度刚好相等时被压缩。 */
+    .chart .plot { height: 150px; display: flex; flex-direction: column; justify-content: flex-end; }
+    .chart .plot i { flex: 0 0 auto; display: block; border-radius: 2px; }
+    .chart .plot i.p { background: #b9c6ef; }
+    .chart .plot i.c { background: var(--accent); }
+    .chart .plot i.none { height: 2px; background: var(--line); }
     .chart .x { font-size: 10.5px; color: var(--muted); text-align: center; white-space: nowrap; }
     /* 图例挂在工具栏上（不在 .chart 里），所以选择器不能带 .chart 前缀。 */
     .legend { display: inline-flex; gap: 12px; align-items: center; font-size: 11.5px; color: var(--muted); }
@@ -1119,6 +1125,15 @@
     }
 
     // ---------- 产品 ----------
+    // 产品名配了后台地址才是链接：没配就退化成纯文本，不留「点了没反应」的假链接。
+    function productName(p) {
+      const id = esc(p.id);
+      const url = String(p.console_url || '').trim();
+      if (!/^https?:\/\//i.test(url)) return '<span class="id">' + id + '</span>';
+      return '<a class="id" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer"' +
+        ' title="打开产品后台：' + esc(url) + '">' + id + '</a>';
+    }
+
     async function loadProducts() {
       const payload = await api('/products');
       products = payload.data || [];
@@ -1126,7 +1141,7 @@
         const bad = p.health && p.health.last_error;
         return '<tr class="card ' + (p.enabled ? (bad ? 'warn' : 'ok') : '') + '">' +
           rail() +
-          cell('产品', '<div class="cell-id"><span class="id">' + esc(p.id) + '</span><small>' + esc(p.name || '未命名') + '</small></div>') +
+          cell('产品', '<div class="cell-id">' + productName(p) + '<small>' + esc(p.name || '未命名') + '</small></div>') +
           cell('协议', chip(esc(p.protocol || 'openai-chat'))) +
           cell('地址', '<span class="mono">' + esc(p.base_url) + '</span>') +
           cell('状态', p.enabled ? chip('启用', 'ok') : chip('停用')) +
@@ -1152,6 +1167,8 @@
         '<div class="row"><label>协议<input id="f-protocol" value="' + esc(p.protocol || 'openai-chat') + '"></label>' +
         '<label>启用<select id="f-enabled"><option value="1"' + (p.enabled ? ' selected' : '') + '>是</option><option value="0"' + (p.enabled ? '' : ' selected') + '>否</option></select></label></div>' +
         '<div class="row"><label>base_url<input id="f-base" value="' + esc(p.base_url) + '"></label></div>' +
+        '<div class="row"><label>产品后台 url<input id="f-console-url" value="' + esc(p.console_url || '') + '" placeholder="http://127.0.0.1:7863/admin"></label></div>' +
+        '<p class="muted">产品自己的管理后台地址，只用于列表里点产品名跳过去（新标签页）；留空则产品名不可点。</p>' +
         '<div class="row"><label>chat_path<input id="f-chat-path" value="' + esc(p.chat_path || '') + '" placeholder="/v1/chat/completions"></label>' +
         '<label>models_path<input id="f-models-path" value="' + esc(p.models_path || '') + '" placeholder="/v1/models"></label></div>' +
         '<p class="muted">路径留空用默认值。非标准 OpenAI 兼容端点在这里覆盖，例如 Gemini 兼容层：base_url 填 <code>https://generativelanguage.googleapis.com/v1beta/openai</code>，chat_path 填 <code>/chat/completions</code>。</p>' +
@@ -1176,6 +1193,7 @@
           protocol: document.getElementById('f-protocol').value.trim() || 'openai-chat',
           enabled: document.getElementById('f-enabled').value === '1',
           base_url: document.getElementById('f-base').value.trim(),
+          console_url: document.getElementById('f-console-url').value.trim(),
           api_key: document.getElementById('f-key').value.trim(),
           timeout: {
             connect: document.getElementById('f-connect').value.trim() || '5s',
@@ -1191,6 +1209,11 @@
         };
         if (!data.id) { toast('ID 不能为空'); return; }
         if (data.proxy.enabled && !data.proxy.url) { toast('启用代理时必须填写代理地址'); return; }
+        // 后台地址会变成可点击链接：只认 http/https，和后端 ValidateConsoleURL 同口径。
+        if (data.console_url && !/^https?:\/\/[^/]/i.test(data.console_url)) {
+          toast('产品后台 url 必须是 http:// 或 https:// 开头的完整地址');
+          return;
+        }
         // 路径必须是站内路径：填成完整 URL 会拼出不可请求的地址。
         for (const [label, value] of [['chat_path', data.chat_path], ['models_path', data.models_path]]) {
           if (!value) continue;
@@ -2103,7 +2126,7 @@
         ].join('\n');
         return '<div class="col" title="' + esc(tip) + '">' +
           '<span class="val">' + (total ? fmtTokens(total) : '') + '</span>' +
-          '<div class="bar">' +
+          '<div class="plot">' +
             (total
               ? (completionHeight ? '<i class="c" style="height:' + completionHeight + 'px"></i>' : '') +
                 (promptHeight ? '<i class="p" style="height:' + promptHeight + 'px"></i>' : '')

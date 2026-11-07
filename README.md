@@ -155,7 +155,7 @@ export MODELGW_ADMIN_TOKEN='your-strong-token'
 | `routing` | 最大尝试次数、冷却与熔断、粘性会话 |
 | `probe` | 异常成员后台探活（间隔、同产品节流） |
 | `logging` | 请求日志目录、保留天数 |
-| `products` | 下游产品：`base_url` / `api_key` / 超时 / 端点路径 / 出网代理（默认关闭）/ `disabled_models`（停用模型） |
+| `products` | 下游产品：`base_url` / `api_key` / 超时 / 端点路径 / 出网代理（默认关闭）/ `disabled_models`（停用模型）/ `console_url`（产品后台地址，面板点产品名直达） |
 | `model_groups` | 对外模型组：成员 = 产品 + 真实模型 + 权重 |
 | `tokens` | 虚拟 Token（只存 SHA-256，明文仅创建时返回一次） |
 
@@ -339,7 +339,7 @@ curl ... -H "X-Session-Id: my-conversation-42"
 
 | 页面 | 作用 |
 | --- | --- |
-| `/panel/products` | 产品增删改、连通性测试、key 掩码展示 |
+| `/panel/products` | 产品增删改、连通性测试、key 掩码展示；填了 `console_url` 的产品，点产品名可在新标签页打开它自己的后台 |
 | `/panel/groups` | 模型组成员、权重上下移、成员状态与手动嗅探 |
 | `/panel/models` | 各产品模型清单（可强制回源刷新）；**停用的产品不列出**，单个模型可停用/启用（被模型组使用的不能停用；停用状态按「产品 + 模型名」保存，刷新目录后仍保留） |
 | `/panel/logs` | 请求日志查询（按结果 / 产品 / 状态码 / 关键字），分页默认 100 条/页（上限 100），可选 50/100，支持 5s 自动刷新（只存浏览器） |
