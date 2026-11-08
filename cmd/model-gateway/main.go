@@ -59,7 +59,9 @@ func run() error {
 	}
 
 	snapshot := st.Snapshot()
-	logger := reqlog.New(snapshot.Logging.Dir, snapshot.Logging.RetentionDays)
+	// max_file_mb 必须在这里接上：配置项写了却没有消费方，等于给运维一个假承诺。
+	logger := reqlog.New(snapshot.Logging.Dir, snapshot.Logging.RetentionDays).
+		WithMaxFileMB(snapshot.Logging.MaxFileMB)
 	defer logger.Close()
 
 	// 用量累计器独立于请求日志：日志受保留期限制会删文件，这里折叠后长期保留。

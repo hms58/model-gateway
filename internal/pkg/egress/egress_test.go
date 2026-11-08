@@ -53,6 +53,27 @@ func TestProxyCacheSeparatesProductsAndConfigs(t *testing.T) {
 	}
 }
 
+// 面板保存 / 删除产品时必须能清掉旧 client：clientKey 完全可能一字未变（全量覆盖保存），
+// 不清就会继续用旧代理配置，且旧连接池（每 host 32 条空闲连接）永久滞留。
+func TestInvalidateDropsClientsOfOneProductOnly(t *testing.T) {
+	product := config.Product{ID: "p-drop"}
+	plain, _ := Client(product, 5*time.Second, 30*time.Second, 30*time.Second, false)
+	stream, _ := Client(product, 5*time.Second, 30*time.Second, 30*time.Second, true)
+	kept, _ := Client(config.Product{ID: "p-keep"}, 5*time.Second, 30*time.Second, 30*time.Second, false)
+
+	Invalidate(product.ID)
+
+	if again, _ := Client(product, 5*time.Second, 30*time.Second, 30*time.Second, false); again == plain {
+		t.Fatal("Invalidate 后应重建 client，而不是复用旧连接池")
+	}
+	if again, _ := Client(product, 5*time.Second, 30*time.Second, 30*time.Second, true); again == stream {
+		t.Fatal("流式 client 也应被清掉")
+	}
+	if again, _ := Client(config.Product{ID: "p-keep"}, 5*time.Second, 30*time.Second, 30*time.Second, false); again != kept {
+		t.Fatal("不应影响其它产品的 client")
+	}
+}
+
 func TestProxyURLValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name string

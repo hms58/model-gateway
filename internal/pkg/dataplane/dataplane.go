@@ -1,17 +1,16 @@
 package dataplane
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"model-gateway/internal/config"
@@ -26,6 +25,10 @@ import (
 // MaxBodyBytes 限制请求体，避免超大 messages 打爆内存。
 const MaxBodyBytes = 32 << 20
 
+// maxErrorBodyBytes 是「非 2xx 响应」最多读入的字节数：够分类、够透传给客户端，
+// 又不会因为上游回一整包错误页把内存吃掉。
+const maxErrorBodyBytes = 1 << 20
+
 // statusClientClosed 沿用 Nginx 的 499：客户端在收到响应前断开，便于日志区分。
 const statusClientClosed = 499
 
@@ -38,8 +41,6 @@ func clientGone(r *http.Request) bool {
 type Handler struct {
 	store     *store.Store
 	forwarder *proxy.Forwarder
-	mu        sync.Mutex
-	rnd       *rand.Rand
 	logger    *reqlog.Logger
 	usage     *usage.Recorder
 }
@@ -58,11 +59,7 @@ func (h *Handler) WithUsage(recorder *usage.Recorder) *Handler {
 }
 
 func New(st *store.Store) *Handler {
-	return &Handler{
-		store:     st,
-		forwarder: proxy.NewForwarder(),
-		rnd:       rand.New(rand.NewSource(time.Now().UnixNano())),
-	}
+	return &Handler{store: st, forwarder: proxy.NewForwarder()}
 }
 
 // Attempt 是返回给客户端的降级明细。
@@ -126,140 +123,201 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maxAttempts := cfg.Routing.MaxAttempts
+	routing := relayRequest{
+		cfg:        cfg,
+		body:       body,
+		groupName:  groupName,
+		sessionKey: strings.TrimSpace(r.Header.Get("X-Session-Id")),
+		record:     record,
+		streaming:  streamRequest(body),
+	}
+	h.relay(w, r, routing)
+}
+
+// relayRequest 是一次降级链的固定输入；流式与非流式只差 streaming 一个布尔位。
+type relayRequest struct {
+	cfg        *config.Config
+	body       []byte
+	groupName  string
+	sessionKey string
+	record     config.Token
+	streaming  bool
+}
+
+// relayState 累积整条降级链的观测数据，供 defer 里统一落日志与用量。
+//
+// 抽出来是因为流式与非流式必须产出**同一套** attempts / outcome / status 口径：
+// 两份拷贝曾经各自演化（失败码一个回 lastStatus、一个回 502），
+// 排查时「同一个故障在流式与非流式日志里对不上」。
+type relayState struct {
+	attempts          []Attempt
+	status            int
+	outcome           proxy.Outcome
+	ttfbMs            int64
+	usage             proxy.Usage
+	product           string
+	lastPayload       []byte
+	lastHeader        http.Header
+	lastUpstreamError string
+}
+
+// relay 是数据面唯一的降级主循环：选路 → 转发 → 分类 → 冷却 / 计数 → 降级。
+// streaming 只影响三处：用哪个转发方法、成功时是否强制 text/event-stream、请求名。
+func (h *Handler) relay(w http.ResponseWriter, r *http.Request, req relayRequest) {
+	maxAttempts := req.cfg.Routing.MaxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
-	sessionKey := strings.TrimSpace(r.Header.Get("X-Session-Id"))
-	if streamRequest(body) {
-		h.streamChat(w, r, cfg, body, groupName, sessionKey, record)
-		return
-	}
 	tried := make(map[string]struct{}, maxAttempts)
-	attempts := make([]Attempt, 0, maxAttempts)
+	state := &relayState{attempts: make([]Attempt, 0, maxAttempts)}
 
 	started := time.Now()
-	var lastStatus int
-	var lastOutcome proxy.Outcome
-	var lastTTFB int64
-	var lastUsage proxy.Usage
-	var lastProduct string
-	// 400/422 的上游响应要留着：所有成员都拒绝时把它原样回给客户端，
-	// 比自造的 "all members failed" 更能说明「是谁在拒什么」。
-	var lastPayload []byte
-	var lastHeader http.Header
-	var lastUpstreamError string
+	// 半开探测名额必须归还：401/403、status_rules 命中、客户端断开这三条分支
+	// 都不会走 Success/Probe，漏还的名额会让成员永久「不可选也不被探活」。
+	// 每次尝试结束（下一轮选路前）就归还，名额只在本次尝试期间被占用。
+	var claimedProbes []string
+	releaseProbes := func() {
+		for _, key := range claimedProbes {
+			h.store.State().ReleaseProbe(key)
+		}
+		claimedProbes = claimedProbes[:0]
+	}
+	defer releaseProbes()
 	defer func() {
-		h.noteUsage(record.ID, lastProduct, lastOutcome)
+		h.noteUsage(req.record.ID, state.product, state.outcome)
 		entry := reqlog.Entry{
 			RequestID: requestID(), ClientRequestID: clientRequestID(r),
 			ClientIP: clientIP(r), UA: r.UserAgent(),
-			TokenID: record.ID, TokenName: record.Name, Group: groupName, Stream: false,
+			TokenID: req.record.ID, TokenName: req.record.Name,
+			Group: req.groupName, Stream: req.streaming,
 			DurationMs: time.Since(started).Milliseconds(),
-			HTTPStatus: lastStatus, Outcome: string(lastOutcome),
-			TTFBMs: lastTTFB, Attempts: toReqlogAttempts(attempts),
-			PromptTokens: lastUsage.PromptTokens, CompletionTokens: lastUsage.CompletionTokens,
-			TotalTokens:    lastUsage.TotalTokens,
-			CacheHitTokens: int64(lastUsage.CacheHitTokens),
-			CacheHitRate:   cacheHitRate(lastUsage.CacheHitTokens, lastUsage.PromptTokens),
-			Credit:         lastUsage.Credit,
-			UpstreamError:  lastUpstreamError,
-			CreditKnown:    lastUsage.HasCredit,
+			HTTPStatus: state.status, Outcome: string(state.outcome),
+			TTFBMs: state.ttfbMs, Attempts: toReqlogAttempts(state.attempts),
+			PromptTokens: state.usage.PromptTokens, CompletionTokens: state.usage.CompletionTokens,
+			TotalTokens:    state.usage.TotalTokens,
+			CacheHitTokens: int64(state.usage.CacheHitTokens),
+			CacheHitRate:   cacheHitRate(state.usage.CacheHitTokens, state.usage.PromptTokens),
+			Credit:         state.usage.Credit,
+			UpstreamError:  state.lastUpstreamError,
+			CreditKnown:    state.usage.HasCredit,
 		}
-		if len(attempts) > 0 {
-			last := attempts[len(attempts)-1]
+		if len(state.attempts) > 0 {
+			last := state.attempts[len(state.attempts)-1]
 			entry.Product, entry.Model = last.Product, last.Model
 		}
 		h.writeLog(entry)
-		h.recordUsage(entry, lastUsage, lastOutcome == proxy.OutcomeOK)
+		h.recordUsage(entry, state.usage, state.outcome == proxy.OutcomeOK)
 	}()
 
 	for i := 0; i < maxAttempts; i++ {
+		releaseProbes() // 上一轮尝试已得出结论，名额不该跨尝试持有
 		if clientGone(r) {
-			lastStatus, lastOutcome = statusClientClosed, proxy.OutcomeClientCanceled
+			state.status, state.outcome = statusClientClosed, proxy.OutcomeClientCanceled
 			writeError(w, statusClientClosed, "客户端已断开")
 			return
 		}
-		member, key, pickErr := h.pick(cfg, groupName, sessionKey, tried)
+		member, key, pickErr := h.pick(req.cfg, req.groupName, req.sessionKey, tried)
 		if pickErr != nil {
-			if errors.Is(pickErr, router.ErrGroupNotFound) {
+			switch {
+			case errors.Is(pickErr, router.ErrGroupNotFound):
+				state.status, state.outcome = http.StatusNotFound, proxy.Outcome("group_not_found")
 				writeError(w, http.StatusNotFound, "模型组不存在")
-				return
-			}
-			if errors.Is(pickErr, router.ErrGroupDisabled) {
+			case errors.Is(pickErr, router.ErrGroupDisabled):
+				state.status, state.outcome = http.StatusForbidden, proxy.Outcome("group_disabled")
 				writeError(w, http.StatusForbidden, "模型组已禁用")
+			case len(state.attempts) == 0:
+				state.status, state.outcome = http.StatusServiceUnavailable, proxy.Outcome("no_member")
+				writeError(w, http.StatusServiceUnavailable, "无可用成员")
+			default:
+				// 已试成员全被排除：跳出循环走「最后一次上游响应」收尾。
+			}
+			if len(state.attempts) == 0 || errors.Is(pickErr, router.ErrGroupNotFound) ||
+				errors.Is(pickErr, router.ErrGroupDisabled) {
 				return
 			}
 			break
 		}
 		tried[key] = struct{}{}
+		claimedProbes = append(claimedProbes, key)
 
-		product := productOf(cfg, member.Product)
-		lastProduct = member.Product
+		product := productOf(req.cfg, member.Product)
+		state.product = member.Product
 		if !supportedProtocol(product) {
-			lastStatus, lastOutcome = http.StatusBadRequest, proxy.Outcome("unsupported_protocol")
-			attempts = append(attempts, Attempt{Product: member.Product, Model: member.Model, Status: http.StatusBadRequest, Code: string(lastOutcome)})
+			state.status, state.outcome = http.StatusBadRequest, proxy.Outcome("unsupported_protocol")
+			state.attempts = append(state.attempts, Attempt{
+				Product: member.Product, Model: member.Model,
+				Status: http.StatusBadRequest, Code: string(state.outcome),
+			})
 			writeProtocolError(w)
 			return
 		}
-		started := time.Now()
-		response, callErr := h.forwarder.DoResponse(r.Context(), product, body, member.Model)
-		ttfb := time.Since(started)
+
+		attemptStarted := time.Now()
+		response, callErr := h.forward(r.Context(), req, product, member.Model)
+		ttfb := time.Since(attemptStarted)
 		elapsed := ttfb.Milliseconds()
 		if callErr != nil {
 			// 客户端断开会让 r.Context() 取消：后续重试必然 0ms 失败，
 			// 且这不是上游故障，不能把成员打进冷却。
 			if clientGone(r) {
-				lastStatus, lastOutcome = statusClientClosed, proxy.OutcomeClientCanceled
-				attempts = append(attempts, Attempt{Product: member.Product, Model: member.Model, Status: 0, Code: string(lastOutcome), MS: elapsed})
+				state.status, state.outcome = statusClientClosed, proxy.OutcomeClientCanceled
+				state.attempts = append(state.attempts, Attempt{
+					Product: member.Product, Model: member.Model, Code: string(state.outcome), MS: elapsed,
+				})
 				writeError(w, statusClientClosed, "客户端已断开")
 				return
 			}
-			h.fail(key, transportCooldown(cfg.Routing.Cooldown, ttfb), shortError(callErr))
-			attempts = append(attempts, Attempt{Product: member.Product, Model: member.Model, Status: 0, Code: string(proxy.OutcomeUpstream), MS: elapsed})
-			lastStatus = http.StatusBadGateway
-			lastOutcome = proxy.OutcomeUpstream
+			h.fail(key, transportCooldown(req.cfg.Routing.Cooldown, ttfb), shortError(callErr))
+			state.attempts = append(state.attempts, Attempt{
+				Product: member.Product, Model: member.Model, Code: string(proxy.OutcomeUpstream), MS: elapsed,
+			})
+			state.status = http.StatusBadGateway
+			state.outcome = proxy.OutcomeUpstream
 			continue
 		}
 
 		outcome := proxy.Classify(response.StatusCode)
-		attempts = append(attempts, Attempt{
+		state.attempts = append(state.attempts, Attempt{
 			Product: member.Product, Model: member.Model,
 			Status: response.StatusCode, Code: string(outcome), MS: elapsed,
 		})
-		lastStatus = response.StatusCode
-		lastOutcome = outcome
-		lastTTFB = ttfb.Milliseconds()
+		state.status, state.outcome = response.StatusCode, outcome
+		state.ttfbMs = elapsed
 
 		if outcome == proxy.OutcomeOK {
 			h.succeed(key)
-			h.bindSticky(cfg, sessionKey, key)
+			h.bindSticky(req.cfg, req.sessionKey, key)
 			copyHeader(w.Header(), response.Header)
+			if req.streaming {
+				w.Header().Set("Content-Type", "text/event-stream")
+			}
 			w.WriteHeader(response.StatusCode)
 			flusher, _ := w.(http.Flusher)
 			usage, copyErr := proxy.StreamCopy(w, response.Body, flusher)
 			response.Body.Close()
-			lastUsage = usage
+			state.usage = usage
 			if copyErr != nil {
 				// 已经写出字节：只记录，不重试。
-				lastOutcome = proxy.Outcome("mid_stream")
-				h.fail(key, cfg.Routing.Cooldown, "mid_stream")
+				state.outcome = proxy.Outcome("mid_stream")
+				state.attempts[len(state.attempts)-1].Code = string(state.outcome)
+				h.fail(key, req.cfg.Routing.Cooldown, "mid_stream")
 			}
 			return
 		}
 
+		// 非 2xx：读掉有限字节再关闭。400/422 的响应体要留着（所有成员都拒时原样回给客户端），
+		// 其余只用来让连接可复用。
+		payload, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBodyBytes))
+		response.Body.Close()
+
 		if outcome == proxy.OutcomeClientError {
-			// 400 / 422 不一定是请求本身错：不同上游对同一份请求的宽容度不同
-			// （例如 Gemini 兼容层会拒掉某些 OpenAI 字段），换成员仍可能成功。
-			payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-			response.Body.Close()
-			lastPayload, lastHeader = payload, response.Header.Clone()
-			lastUpstreamError = upstreamErrorSummary(payload)
+			state.lastPayload, state.lastHeader = payload, response.Header.Clone()
+			state.lastUpstreamError = upstreamErrorSummary(payload)
 			// 额度耗尽 / 地区不支持 / 凭据无效：重试同一成员也没用，摘一段时间；
 			// 参数与 schema 不兼容则只降级，不把成员算成故障。
-			if unavailableClientError(lastUpstreamError) {
-				h.park(key, cfg.Routing.Cooldown.UnavailableDuration, "上游不可用（HTTP 400）")
-			} else if rule, ok := cfg.Routing.Cooldown.RuleFor(response.StatusCode); ok {
+			if unavailableClientError(state.lastUpstreamError) {
+				h.park(key, req.cfg.Routing.Cooldown.UnavailableDuration, "上游不可用（HTTP 400）")
+			} else if rule, ok := req.cfg.Routing.Cooldown.RuleFor(response.StatusCode); ok {
 				// 连续同状态码达到阈值：说明不是个别请求不兼容，而是协议/参数系统性变了，
 				// 继续每个请求都白撞一次只会拖慢全部流量。
 				h.countStatus(key, rule)
@@ -267,50 +325,52 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		_, _ = io.CopyN(io.Discard, response.Body, 512)
-		response.Body.Close()
-
 		// 其他状态码命中 status_rules 时同样走独立计数，不再叠加指数退避。
-		if rule, ok := cfg.Routing.Cooldown.RuleFor(response.StatusCode); ok {
+		if rule, ok := req.cfg.Routing.Cooldown.RuleFor(response.StatusCode); ok {
 			h.countStatus(key, rule)
 			continue
 		}
 		// 401 / 403 是产品凭据问题：换产品仍可能成功，但不该冷却成员。
 		if outcome != proxy.OutcomeProductAuth {
-			h.fail(key, cfg.Routing.Cooldown, statusReason(outcome, response.StatusCode))
+			h.fail(key, req.cfg.Routing.Cooldown, statusReason(outcome, response.StatusCode))
 		}
 	}
 
-	if lastStatus == 0 {
-		lastStatus = http.StatusServiceUnavailable
-		lastOutcome = proxy.Outcome("no_member")
+	if state.status == 0 {
+		state.status, state.outcome = http.StatusServiceUnavailable, proxy.Outcome("no_member")
 		writeError(w, http.StatusServiceUnavailable, "无可用成员")
 		return
 	}
 	// 最后一次尝试是「上游拒绝请求」：把它的响应原样回给客户端。
 	// 客户端能直接看到是哪个上游、拒了什么，比自造的 all members failed 更有用。
-	if lastOutcome == proxy.OutcomeClientError && len(lastPayload) > 0 {
-		copyHeader(w.Header(), lastHeader)
-		w.WriteHeader(lastStatus)
-		_, _ = w.Write(lastPayload)
+	if state.outcome == proxy.OutcomeClientError && len(state.lastPayload) > 0 {
+		copyHeader(w.Header(), state.lastHeader)
+		w.WriteHeader(state.status)
+		_, _ = w.Write(state.lastPayload)
 		return
 	}
 	// 不复制上游头：上游的 Content-Length / 压缩标记与这里的自有 JSON 不一致，会导致客户端截断。
-	writeJSON(w, lastStatus, map[string]interface{}{
+	writeJSON(w, state.status, map[string]interface{}{
 		"error": map[string]interface{}{
 			"message":  "all members failed",
 			"type":     "upstream_error",
-			"attempts": attempts,
+			"attempts": state.attempts,
 		},
 	})
 }
 
+// forward 按 stream 与否选择转发方法：唯一影响 I/O 形态的分支。
+func (h *Handler) forward(ctx context.Context, req relayRequest, product config.Product, model string) (*http.Response, error) {
+	if req.streaming {
+		return h.forwarder.DoStreamResponse(ctx, product, req.body, model)
+	}
+	return h.forwarder.DoResponse(ctx, product, req.body, model)
+}
+
+// pick 选出一个未试成员。选路本身无需随机源，所以这里不持锁：
+// 并发请求各自独立评估候选，共享状态由 State 自己的锁保护。
 func (h *Handler) pick(cfg *config.Config, groupName, sessionKey string, tried map[string]struct{}) (config.Member, string, error) {
-	// rand.Rand 非并发安全：选路期间持锁；已试成员由 PickExcluding 在候选阶段剔除，
-	// 冷却过期也不会重新选中，避免长超时后降级链被误判为「无可用成员」。
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return router.PickExcluding(cfg, h.store.State(), groupName, sessionKey, tried, h.rnd)
+	return router.PickExcluding(cfg, h.store.State(), groupName, sessionKey, tried)
 }
 
 // transportCooldown 把传输层失败的实际耗时作为冷却基数下限。
@@ -395,23 +455,15 @@ func shortError(err error) string {
 	if err == nil {
 		return ""
 	}
-	text := err.Error()
-	if len(text) > 160 {
-		text = text[:160]
-	}
-	return text
+	return clipRunes(err.Error(), 160)
 }
 
 // upstreamErrorSummary 把上游 400/422 的响应压成一行摘要落进请求日志：
 // 排查「哪个上游挑剔什么参数」时不必再靠外部复现。只保留前 200 个字符。
 func upstreamErrorSummary(payload []byte) string {
-	const limit = 200
-	text := strings.Join(strings.Fields(string(payload)), " ")
-	runes := []rune(text)
-	if len(runes) > limit {
-		text = string(runes[:limit])
-	}
-	return text
+	// 先按字节截断再转 rune：payload 最大 1MB，整串转 []rune 是 4 倍临时分配。
+	text := strings.Join(strings.Fields(string(clipBytes(payload, 4<<10))), " ")
+	return clipRunes(text, 200)
 }
 
 // unavailableClientError 判断 400/422 是否属于「重试同一成员也没用」的情况：
@@ -527,7 +579,7 @@ func requestID() string {
 func clientRequestID(r *http.Request) string {
 	for _, name := range []string{"X-Request-Id", "X-Request-ID", "X-Trace-Id", "X-Correlation-Id", "Request-Id"} {
 		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
-			return clipText(value, 128)
+			return clipRunes(value, 128)
 		}
 	}
 	return ""
@@ -541,15 +593,38 @@ func cacheHitRate(hit, prompt int) float64 {
 	return float64(hit) / float64(prompt)
 }
 
-// clipText 裁到可读长度，避免超长头值撑爆日志行。
-func clipText(text string, limit int) string {
+// clipBytes 按字节截断，只用于「随后还要继续解析」的场景（如 JSON 摘要），
+// 不用于直接展示——字节截断会把中文切成乱码。
+func clipBytes(text []byte, limit int) []byte {
 	if len(text) <= limit {
 		return text
 	}
 	return text[:limit]
 }
 
+// clipRunes 按字符截断，保证面板展示的中文不被切成非法 UTF-8。
+func clipRunes(text string, limit int) string {
+	if utf8RuneCount(text) <= limit {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:limit])
+}
+
+// utf8RuneCount 统计字符数：ASCII 走快路径，避免为短文本分配 []rune。
+func utf8RuneCount(text string) int {
+	count := 0
+	for i := 0; i < len(text); i++ {
+		// UTF-8 续字节形如 10xxxxxx，跳过它们即可按首字节计数。
+		if text[i]&0xC0 != 0x80 {
+			count++
+		}
+	}
+	return count
+}
+
 // clientIP 优先取反代写入的 X-Forwarded-For 首段，其次 RemoteAddr。
+// 仅用于日志记录：是否放行请求由 Token / 组权限决定，不依赖来源地址。
 func clientIP(r *http.Request) string {
 	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
 		if idx := strings.IndexByte(forwarded, ','); idx > 0 {

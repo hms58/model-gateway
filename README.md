@@ -154,8 +154,8 @@ export MODELGW_ADMIN_TOKEN='your-strong-token'
 | `data_dir` | 运行态 / 模型缓存的默认目录 |
 | `routing` | 最大尝试次数、冷却与熔断、粘性会话 |
 | `probe` | 异常成员后台探活（间隔、同产品节流） |
-| `logging` | 请求日志目录、保留天数 |
-| `products` | 下游产品：`base_url` / `api_key` / 超时 / 端点路径 / 出网代理（默认关闭）/ `disabled_models`（停用模型）/ `console_url`（产品后台地址，面板点产品名直达） |
+| `logging` | 请求日志目录、保留天数、单文件大小上限 `max_file_mb`（超过则续写 `requests-YYYYMMDD.N.jsonl`） |
+| `products` | 下游产品：`base_url` / `api_key` / 超时 / 端点路径 / 出网代理（默认关闭）/ `disabled_models`（停用模型）/ `console_url`（产品后台地址，面板点产品名直达）/ `weight`（仅面板排序，大的在前，停用的排最后） |
 | `model_groups` | 对外模型组：成员 = 产品 + 真实模型 + 权重 |
 | `tokens` | 虚拟 Token（只存 SHA-256，明文仅创建时返回一次） |
 
@@ -378,8 +378,12 @@ python -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdige
 
 | 来源 | 行为 |
 | --- | --- |
-| 本机（`127.0.0.1` / `::1`，或反代写在 `X-Forwarded-For` 首段的回环地址） | **免登录**，可直接进配置页设口令 |
+| 本机（TCP 对端为 `127.0.0.1` / `::1`） | **免登录**，可直接进配置页设口令 |
 | 其他任何来源 | 一律 401，提示「尚未设置管理口令：初始化只允许本机访问」 |
+
+> 判定只看 TCP 对端地址，**不采信 `X-Forwarded-For`**：该头完全由客户端控制，
+> 一旦据此放行，远程伪造 `X-Forwarded-For: 127.0.0.1` 就能改 `base_url`，
+> 把上游 `api_key` 引到攻击者地址。反代场景请直接设好口令（口令校验与来源无关）。
 
 流程：
 

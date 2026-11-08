@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -22,13 +23,18 @@ type stateFile struct {
 
 // Store 持有配置快照与运行态：数据面只读快照，控制面整体替换，互不阻塞。
 type Store struct {
+	// saveMu 串行化「读版本 → 比对 → 写盘」整段：版本检查是 read-check-write，
+	// 两个并发保存读到同一版本时会双双通过检查，后写覆盖先写、静默丢改动。
+	saveMu    sync.Mutex
 	mu        sync.RWMutex
 	cfgPath   string
 	statePath string
 	snapshot  atomic.Value // *config.Config
 	state     *router.State
 	version   int
-	dirty     int32
+	// stateVersion 只用于 state.json 的版本号，与配置版本互不相干。
+	stateVersion int
+	dirty        int32
 }
 
 // Open 加载配置与运行态；state 文件不存在属正常首次启动。
@@ -61,6 +67,9 @@ func (s *Store) State() *router.State { return s.state }
 
 // Save 按版本号保存配置并替换快照；版本不一致返回 config.ErrVersionConflict。
 func (s *Store) Save(cfg config.Config, expect int) error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
 	if err := config.SaveWithVersion(s.cfgPath, &cfg, expect); err != nil {
 		return err
 	}
@@ -77,6 +86,9 @@ func (s *Store) Save(cfg config.Config, expect int) error {
 
 // Reload 重新读盘并替换快照（面板或外部改动后调用）。
 func (s *Store) Reload() error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
 	cfg, err := config.Load(s.cfgPath)
 	if err != nil {
 		return err
@@ -89,21 +101,33 @@ func (s *Store) Reload() error {
 }
 
 // Rollback 用 `.bak` 恢复上一版配置；版本号继续递增，不回退。
+// 回滚是「配置被改坏」时的自救通道，所以读当前版本同样只解析 version 字段，
+// 不走全量校验（否则当前文件非法时连回滚都做不到）。
 func (s *Store) Rollback() error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
 	raw, err := os.ReadFile(s.cfgPath + ".bak")
 	if err != nil {
 		return err
 	}
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
 	var restored config.Config
 	if err := json.Unmarshal(raw, &restored); err != nil {
 		return err
 	}
-	current := s.Snapshot()
-	restored.Version = current.Version + 1
+	version, err := config.ReadVersion(s.cfgPath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	restored.Version = version + 1
 	if err := config.SaveAtomic(s.cfgPath, &restored); err != nil {
 		return err
 	}
 	s.snapshot.Store(&restored)
+	s.mu.Lock()
+	s.version = restored.Version
+	s.mu.Unlock()
 	return nil
 }
 
@@ -125,19 +149,35 @@ func (s *Store) LoadState() error {
 	return nil
 }
 
-// SaveState 原子写回运行态；写成功才清脏标记。
+// SaveState 原子写回运行态。
+//
+// 脏标记在导出之前清掉、写盘失败再置回：反过来（写完才清）会把导出与清标记
+// 之间发生的变更一起清掉，那次改动就要等下一次变更才可能落盘。
 func (s *Store) SaveState() error {
+	atomic.StoreInt32(&s.dirty, 0)
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.version++
+	// state.json 用自己的版本号：借配置版本会在每次落盘时改动 s.version，
+	// 让「配置版本」与「运行态版本」互相污染。
+	s.stateVersion++
+	version := s.stateVersion
+	s.mu.Unlock()
 
 	snapshot := s.state.Export()
 	payload := stateFile{
-		Version:  s.version,
+		Version:  version,
 		Members:  snapshot.Members,
 		Products: snapshot.Products,
 		Tokens:   snapshot.Tokens,
 	}
+	if err := s.writeStateFile(payload); err != nil {
+		atomic.StoreInt32(&s.dirty, 1)
+		return err
+	}
+	return nil
+}
+
+func (s *Store) writeStateFile(payload stateFile) error {
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
@@ -151,11 +191,7 @@ func (s *Store) SaveState() error {
 	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, s.statePath); err != nil {
-		return err
-	}
-	atomic.StoreInt32(&s.dirty, 0)
-	return nil
+	return os.Rename(tmp, s.statePath)
 }
 
 // MarkDirty 标记运行态需要落盘；请求热路径只做一次原子写，不碰磁盘。

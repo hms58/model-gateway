@@ -39,6 +39,7 @@
             "protocol": "openai-chat",
             "base_url": "http://127.0.0.1:8000",
             "console_url": "http://127.0.0.1:8000/admin",
+            "weight": 100,
             "api_key": "sk-****",
             "enabled": true,
             "timeout": {

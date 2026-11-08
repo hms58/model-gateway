@@ -5,11 +5,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 
 	"model-gateway/internal/config"
 )
+
+// maxLineBytes 限制单行长度。入站请求有 32MB 上限，出站响应必须对称地有界：
+// 上游异常时可能返回一整行超大 JSON，逐行读取会把整行读进内存。
+const maxLineBytes = 8 << 20
+
+// readBufferBytes 是逐行读取的初始缓冲；超过后按需追加，总长受 maxLineBytes 约束。
+const readBufferBytes = 64 << 10
+
+// ErrLineTooLong 表示上游单行响应超过 maxLineBytes。此时字节可能已写给客户端，
+// 调用方按「中途断流」处理，不再重试。
+var ErrLineTooLong = errors.New("上游响应单行超过 8MB 上限")
 
 // Usage 是从响应里提取到的用量；Seen 表示确实出现过 usage 字段。
 type Usage struct {
@@ -27,24 +39,52 @@ type Usage struct {
 
 // StreamCopy 把下游响应体逐块写给客户端并立即 Flush，不做整包缓冲。
 // 同时按行提取 usage（SSE 末尾的 token_usage 与非流式的响应体都能命中）。
+//
+// 单行长度受 maxLineBytes 约束：上游异常时（返回一整行超大 JSON 或长流里没有换行）
+// 不会把整行读进内存，而是立即返回 ErrLineTooLong。非流式响应本身就是单行大 JSON，
+// 所以上限取得比 SSE 分片宽得多，只用来挡住「没有边界」的异常上游。
 func StreamCopy(dst http.ResponseWriter, src io.Reader, flusher http.Flusher) (Usage, error) {
-	reader := bufio.NewReader(src)
+	reader := bufio.NewReaderSize(src, readBufferBytes)
 	usage := Usage{}
+	// pending 暂存「已读到但还没遇到换行」的半行：分片到齐后一次性写出并 flush，
+	// 保证客户端看到的是完整行，而不是被拆成两半的 JSON。
+	var pending []byte
 	for {
-		line, readErr := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			if _, writeErr := dst.Write(line); writeErr != nil {
-				return mergeUsage(usage, line), writeErr
+		chunk, readErr := reader.ReadSlice('\n')
+		if len(chunk) > 0 {
+			pending = append(pending, chunk...)
+			if len(pending) > maxLineBytes {
+				return usage, ErrLineTooLong
+			}
+		}
+		switch {
+		case readErr == nil:
+			// 读到完整行：写出 + flush，并抽取 usage。
+			if _, writeErr := dst.Write(pending); writeErr != nil {
+				return mergeUsage(usage, pending), writeErr
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
-			usage = mergeUsage(usage, line)
-		}
-		if readErr == io.EOF {
-			return usage, nil
-		}
-		if readErr != nil {
+			usage = mergeUsage(usage, pending)
+			pending = pending[:0]
+		case errors.Is(readErr, bufio.ErrBufferFull):
+			// 缓冲满但没换行：继续攒（受 maxLineBytes 约束），不是错误。
+			continue
+		default:
+			// EOF 或 I/O 错误：先把手上的残余字节写出去，再按错误类型返回。
+			if len(pending) > 0 {
+				if _, writeErr := dst.Write(pending); writeErr != nil {
+					return mergeUsage(usage, pending), writeErr
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+				usage = mergeUsage(usage, pending)
+			}
+			if readErr == io.EOF {
+				return usage, nil
+			}
 			return usage, readErr
 		}
 	}

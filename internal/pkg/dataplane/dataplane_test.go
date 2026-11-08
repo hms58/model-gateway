@@ -836,6 +836,52 @@ func TestProductAuthFailureDoesNotCoolMember(t *testing.T) {
 	}
 }
 
+// 半开探测名额必须在请求结束时归还：401/403 只换产品、不冷却成员，
+// 既不走 Success 也不走 Probe，漏还名额会让成员永久「不可选也不被探活」。
+func TestHalfOpenProbeSlotReleasedWhenAttemptNeitherSucceedsNorFails(t *testing.T) {
+	var calls int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt64(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	member := config.Member{Product: "workbuddy", Model: "gpt-5", Weight: 100, Enabled: true}
+	fx := newFixture(t, upstream.URL, []config.Member{member})
+	cfg := *fx.store.Snapshot()
+	cfg.Routing.Cooldown.FailThreshold = 1
+	// 解除时间落盘精度是秒，必须配 1s 以上才能观察到「熔断打开 → 到期」的完整过程。
+	cfg.Routing.Cooldown.OpenDuration = "1s"
+	if err := fx.store.Save(cfg, cfg.Version); err != nil {
+		t.Fatalf("改冷却配置失败：%v", err)
+	}
+	key := config.MemberKey("gpt-5", member)
+	handler := New(fx.store)
+
+	if got := doChat(t, handler, fx.plain); got.Code != http.StatusInternalServerError {
+		t.Fatalf("首次失败应透传 500，实际 %d：%s", got.Code, got.Body.String())
+	}
+	if got := fx.store.State().StatusOf(key).State; got != "breaker" {
+		t.Fatalf("达到阈值应打开熔断，实际 %s", got)
+	}
+	time.Sleep(1200 * time.Millisecond) // 等熔断到期，进入半开
+
+	// 第二次抢到半开名额后上游 401：既不是成功也不是失败，最容易被漏还。
+	if got := doChat(t, handler, fx.plain); got.Code != http.StatusUnauthorized {
+		t.Fatalf("半开探测应透传 401，实际 %d：%s", got.Code, got.Body.String())
+	}
+	// 名额若泄漏，这里会直接变成 503 no_member。
+	if got := doChat(t, handler, fx.plain); got.Code != http.StatusUnauthorized {
+		t.Fatalf("探测名额泄漏导致成员选不到：实际 %d：%s", got.Code, got.Body.String())
+	}
+	if got := fx.store.State().StatusOf(key).State; got == "probing" {
+		t.Fatalf("请求结束后不应继续占用探测名额，实际 %s", got)
+	}
+}
+
 // 一次尝试耗时超过冷却基数时，已试成员会在重试期间复活。
 // 修复前第 3 次选路会重新命中它并被打成「无可用成员」，只试 2 个就 502。
 func TestChatCompletionsRetriesAllMembersWhenCooldownExpiresMidFlight(t *testing.T) {

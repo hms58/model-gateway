@@ -97,11 +97,18 @@ func TestBootstrapModeAllowsLoopbackWithoutCredential(t *testing.T) {
 	}
 }
 
-// 反代把客户端地址放进 X-Forwarded-For：首段是回环才放行。
-func TestBootstrapModeTrustsForwardedLoopback(t *testing.T) {
+// X-Forwarded-For 由客户端完全控制，初始化模式绝不能据此判定「来自本机」：
+// 远程伪造一个 XFF: 127.0.0.1 就能改 base_url，把上游 api_key 引到攻击者地址。
+func TestBootstrapModeIgnoresSpoofedForwardedLoopback(t *testing.T) {
 	server, _ := newBootstrapServer(t)
-	if got := callFrom(t, server.Handler(), "10.0.0.2:5555", "127.0.0.1", http.MethodGet, "/api/modelgw/products"); got.Code != http.StatusOK {
-		t.Fatalf("XFF 首段为回环应放行，实际 %d", got.Code)
+	recorder := callFrom(t, server.Handler(), "10.0.0.2:5555", "127.0.0.1", http.MethodGet, "/api/modelgw/products")
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("伪造 XFF 回环必须拒绝，实际 %d：%s", recorder.Code, recorder.Body.String())
+	}
+	// 写接口同样不能放行，否则可被用来改 base_url。
+	write := callFrom(t, server.Handler(), "10.0.0.2:5555", "127.0.0.1", http.MethodPost, "/api/modelgw/products")
+	if write.Code != http.StatusUnauthorized {
+		t.Fatalf("伪造 XFF 也不应放行写接口，实际 %d", write.Code)
 	}
 }
 
@@ -242,6 +249,70 @@ func TestProductConsoleURLRoundTrip(t *testing.T) {
 	}
 }
 
+// seedProductExtras 预置三个「没有编辑入口」的字段：停用模型、自定义头、备注。
+func seedProductExtras(t *testing.T, st *store.Store) {
+	t.Helper()
+	cfg := st.Snapshot().Clone()
+	cfg.Products[0].DisabledModels = []string{"gpt-4o-mini"}
+	cfg.Products[0].Headers = map[string]string{"X-Trace": "1"}
+	cfg.Products[0].Note = "手工备注"
+	if err := st.Save(cfg, cfg.Version); err != nil {
+		t.Fatalf("预置产品扩展字段失败：%v", err)
+	}
+}
+
+// 面板「编辑产品」只提交表单里可见的字段：没带的字段必须沿用旧值，
+// 否则一次普通编辑就会把停用模型、自定义头、备注静默写成零值。
+func TestSaveProductKeepsOmittedFields(t *testing.T) {
+	server, st := newServer(t)
+	handler := server.Handler()
+	seedProductExtras(t, st)
+
+	saved := call(t, handler, http.MethodPost, "/api/modelgw/products", map[string]interface{}{
+		"version": st.Snapshot().Version,
+		"product": map[string]interface{}{
+			"id": "workbuddy", "enabled": true, "base_url": "http://127.0.0.1:7863", "api_key": "",
+		},
+	})
+	if saved.Code != http.StatusOK {
+		t.Fatalf("保存产品失败：%d %s", saved.Code, saved.Body.String())
+	}
+	after := st.Snapshot().Products[0]
+	if len(after.DisabledModels) != 1 || after.DisabledModels[0] != "gpt-4o-mini" {
+		t.Fatalf("停用列表应保留，实际 %v", after.DisabledModels)
+	}
+	if after.Headers["X-Trace"] != "1" {
+		t.Fatalf("自定义头应保留，实际 %v", after.Headers)
+	}
+	if after.Note != "手工备注" {
+		t.Fatalf("备注应保留，实际 %q", after.Note)
+	}
+}
+
+// 显式传空值表示「就要清空」，保留逻辑不能把这类请求也挡住。
+func TestSaveProductClearsFieldsWhenExplicitlyEmpty(t *testing.T) {
+	server, st := newServer(t)
+	handler := server.Handler()
+	seedProductExtras(t, st)
+
+	saved := call(t, handler, http.MethodPost, "/api/modelgw/products", map[string]interface{}{
+		"version": st.Snapshot().Version,
+		"product": map[string]interface{}{
+			"id": "workbuddy", "enabled": true, "base_url": "http://127.0.0.1:7863", "api_key": "",
+			"disabled_models": []string{},
+			"headers":         map[string]string{},
+			"note":            "",
+		},
+	})
+	if saved.Code != http.StatusOK {
+		t.Fatalf("保存产品失败：%d %s", saved.Code, saved.Body.String())
+	}
+	after := st.Snapshot().Products[0]
+	if len(after.DisabledModels) != 0 || len(after.Headers) != 0 || after.Note != "" {
+		t.Fatalf("显式空值应清空：disabled=%v headers=%v note=%q", after.DisabledModels, after.Headers, after.Note)
+	}
+}
+
 func TestSaveProductStaleVersionReturns409(t *testing.T) {
 	server, _ := newServer(t)
 	recorder := call(t, server.Handler(), http.MethodPost, "/api/modelgw/products", map[string]interface{}{
@@ -267,7 +338,9 @@ func TestDeleteReferencedProductRejected(t *testing.T) {
 	}
 }
 
-func TestSaveGroupWithDuplicateMemberRejected(t *testing.T) {
+// 成员重复不再拦截：同一模型可以配多条（通常用每日时段区分），
+// 完全相同的两行也允许保存——它们在运行态共享冷却，同一次请求只会尝试其中一个。
+func TestSaveGroupWithDuplicateMemberAllowed(t *testing.T) {
 	server, st := newServer(t)
 	version := st.Snapshot().Version
 	recorder := call(t, server.Handler(), http.MethodPost, "/api/modelgw/model-groups", map[string]interface{}{
@@ -280,11 +353,11 @@ func TestSaveGroupWithDuplicateMemberRejected(t *testing.T) {
 			},
 		},
 	})
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("期望 400，实际 %d：%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("重复成员应允许保存，实际 %d：%s", recorder.Code, recorder.Body.String())
 	}
-	if code := errorCode(t, recorder); code != CodeMemberDuplicate {
-		t.Fatalf("期望 20605，实际 %d", code)
+	if got := len(st.Snapshot().ModelGroups[0].Members); got != 2 {
+		t.Fatalf("两条成员都应落盘，实际 %d 条", got)
 	}
 }
 
@@ -600,6 +673,43 @@ func TestLogsListFiltersAndPaginates(t *testing.T) {
 	byKeyword := call(t, handler, http.MethodGet, "/api/modelgw/logs?q=脚本", nil)
 	if !strings.Contains(byKeyword.Body.String(), `"total":1`) {
 		t.Fatalf("关键字过滤应命中 1 条：%s", byKeyword.Body.String())
+	}
+}
+
+// 日志按大小滚动后（requests-YYYYMMDD.N.jsonl），查询必须把同日各分片一起读进来，
+// 否则面板上「今天的日志少了一大半」。
+func TestLogsListReadsRolledParts(t *testing.T) {
+	server, _ := newServer(t)
+	dir := t.TempDir()
+	day := time.Now().In(config.Location()).Format("20060102")
+	lines := map[string]string{
+		"requests-" + day + ".jsonl":   `{"time":"2026-11-05 00:01:00","group":"gpt-5","outcome":"ok","http_status":200}`,
+		"requests-" + day + ".1.jsonl": `{"time":"2026-11-05 00:02:00","group":"gpt-5","outcome":"quota","http_status":429}`,
+	}
+	for name, line := range lines {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(line+"\n"), 0o644); err != nil {
+			t.Fatalf("准备日志失败：%v", err)
+		}
+	}
+	// 非本包命名的文件不应被当成日志读入。
+	if err := os.WriteFile(filepath.Join(dir, "requests-"+day+".txt"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("准备日志失败：%v", err)
+	}
+
+	recorder := call(t, server.WithLogs(dir).Handler(), http.MethodGet, "/api/modelgw/logs", nil)
+	if !strings.Contains(recorder.Body.String(), `"total":2`) {
+		t.Fatalf("同日分片应一起统计：%s", recorder.Body.String())
+	}
+	var payload struct {
+		Data []struct {
+			Outcome string `json:"outcome"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	if len(payload.Data) != 2 || payload.Data[0].Outcome != "quota" {
+		t.Fatalf("应按时间倒序、后一个分片在前：%+v", payload.Data)
 	}
 }
 

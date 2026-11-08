@@ -86,11 +86,49 @@ func TestValidateRejectsInvalidDailyWindow(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsDuplicateMember(t *testing.T) {
+// 成员重复不再拦截：同模型可以配多条（通常用每日时段区分用途），
+// 完全相同的两行也放行——运行态共享，不会放大故障。
+func TestValidateAllowsDuplicateMember(t *testing.T) {
 	cfg := validConfig()
 	cfg.ModelGroups[0].Members = append(cfg.ModelGroups[0].Members, cfg.ModelGroups[0].Members[0])
-	if err := Validate(&cfg); !errors.Is(err, ErrInvalidGroup) {
-		t.Fatalf("期望 ErrInvalidGroup，实际 %v", err)
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("重复成员应放行：%v", err)
+	}
+}
+
+// 同一模型可以按时段重复配置：白天一条、夜间一条，只要时段不同就允许。
+func TestValidateAllowsSameModelWithDifferentWindows(t *testing.T) {
+	cfg := validConfig()
+	first := cfg.ModelGroups[0].Members[0]
+	first.Daily = DailyWindow{Start: "09:00", End: "18:00"}
+	second := first
+	second.Weight = 50
+	second.Daily = DailyWindow{Start: "18:00", End: "09:00"}
+	cfg.ModelGroups[0].Members = []Member{first, second}
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("同模型不同每日时段应允许：%v", err)
+	}
+
+	// 连时段都一样的第三行也放行：成员重复不再做拦截。
+	third := second
+	third.Weight = 10
+	cfg.ModelGroups[0].Members = []Member{first, second, third}
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("完全相同的成员也应放行，实际 %v", err)
+	}
+}
+
+// 产品权重只用于面板排序：0 表示未设置，负值会让排序方向反过来，保存时就拒掉。
+func TestValidateRejectsNegativeProductWeight(t *testing.T) {
+	cfg := validConfig()
+	cfg.Products[0].Weight = -1
+	if err := Validate(&cfg); err == nil {
+		t.Fatal("负权重应被拒")
+	}
+
+	cfg.Products[0].Weight = 0
+	if err := Validate(&cfg); err != nil {
+		t.Fatalf("0 权重表示未设置，应允许：%v", err)
 	}
 }
 
@@ -138,6 +176,35 @@ func TestSaveWithVersionConflict(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".bak"); err != nil {
 		t.Fatalf("覆盖写应保留 .bak：%v", err)
+	}
+}
+
+// 磁盘上的旧配置即使已经不合法（手改坏 weight、残留明文口令段），
+// 也必须能用正确的版本号覆盖保存：版本检查只读 version 字段。
+// 复用 Load 做检查会让「配置被改坏」直接变成「面板永久无法保存」，只能去改文件。
+func TestSaveWithVersionToleratesInvalidExistingConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "modelgw.json")
+	broken := `{"version":7,"listen":":15100","products":[{"id":"p","base_url":"http://x","weight":0}]}`
+	if err := os.WriteFile(path, []byte(broken), 0o644); err != nil {
+		t.Fatalf("准备坏配置失败：%v", err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("前提不成立：这份配置应当校验失败")
+	}
+	version, err := ReadVersion(path)
+	if err != nil || version != 7 {
+		t.Fatalf("读版本应只解析 version 字段：%d %v", version, err)
+	}
+
+	cfg := validConfig()
+	if err := SaveWithVersion(path, &cfg, 6); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("版本不符仍应拒绝，实际 %v", err)
+	}
+	if err := SaveWithVersion(path, &cfg, 7); err != nil {
+		t.Fatalf("版本相符应能保存并把配置修回来：%v", err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("保存后应是合法配置：%v", err)
 	}
 }
 

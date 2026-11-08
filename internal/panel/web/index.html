@@ -730,11 +730,11 @@
         <section class="panel" id="products">
           <div class="bar">
             <button class="primary" id="product-new" type="button">新增产品</button>
-            <span class="muted">删除前需先解除模型组引用</span>
+            <span class="muted">按权重排序（大的在前），停用的排最后；删除前需先解除模型组引用</span>
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th></th><th>产品</th><th>协议</th><th>地址</th><th>状态</th><th>代理</th><th>健康</th><th>操作</th></tr></thead>
+              <thead><tr><th></th><th>产品</th><th>权重</th><th>协议</th><th>地址</th><th>状态</th><th>代理</th><th>健康</th><th>操作</th></tr></thead>
               <tbody id="products-body"></tbody>
             </table>
           </div>
@@ -774,6 +774,11 @@
         <section class="panel" id="models">
           <div class="bar">
             <select id="model-product" aria-label="按产品过滤"><option value="">全部产品</option></select>
+            <select id="model-state" aria-label="按启停状态过滤">
+              <option value="all">全部状态</option>
+              <option value="on">仅启用</option>
+              <option value="off">仅停用</option>
+            </select>
             <input class="search" id="model-q" placeholder="搜索模型">
             <button id="model-refresh" class="primary" type="button">刷新（回源）</button>
             <span class="spacer"></span>
@@ -1134,14 +1139,30 @@
         ' title="打开产品后台：' + esc(url) + '">' + id + '</a>';
     }
 
+    // 产品排序：启用的在前；同状态内按权重降序；权重相同保持配置文件里的原顺序。
+    // 用「下标兜底」而不是直接 sort，避免同权重产品的相对顺序在每次刷新时抖动。
+    function sortProducts(list) {
+      return list
+        .map((item, index) => ({ item, index }))
+        .sort((a, b) => {
+          const byEnabled = Number(b.item.enabled !== false) - Number(a.item.enabled !== false);
+          if (byEnabled !== 0) return byEnabled;
+          const byWeight = (Number(b.item.weight) || 0) - (Number(a.item.weight) || 0);
+          if (byWeight !== 0) return byWeight;
+          return a.index - b.index;
+        })
+        .map(entry => entry.item);
+    }
+
     async function loadProducts() {
       const payload = await api('/products');
-      products = payload.data || [];
+      products = sortProducts(payload.data || []);
       document.getElementById('products-body').innerHTML = products.map(p => {
         const bad = p.health && p.health.last_error;
         return '<tr class="card ' + (p.enabled ? (bad ? 'warn' : 'ok') : '') + '">' +
           rail() +
           cell('产品', '<div class="cell-id">' + productName(p) + '<small>' + esc(p.name || '未命名') + '</small></div>') +
+          cell('权重', '<span class="num">' + (Number(p.weight) || 0) + '</span>') +
           cell('协议', chip(esc(p.protocol || 'openai-chat'))) +
           cell('地址', '<span class="mono">' + esc(p.base_url) + '</span>') +
           cell('状态', p.enabled ? chip('启用', 'ok') : chip('停用')) +
@@ -1155,7 +1176,7 @@
             '<button data-act="test-product" data-id="' + esc(p.id) + '">测试连通</button>' +
             '<button class="danger" data-act="del-product" data-id="' + esc(p.id) + '">删除</button>') +
           '</tr>';
-      }).join('') || '<tr class="card"><td colspan="8"><div class="empty"><b>还没有产品</b>先登记一个下游实例，再建模型组。</div></td></tr>';
+      }).join('') || '<tr class="card"><td colspan="9"><div class="empty"><b>还没有产品</b>先登记一个下游实例，再建模型组。</div></td></tr>';
     }
 
     function productForm(product) {
@@ -1166,7 +1187,9 @@
         '<label>名称<input id="f-name" value="' + esc(p.name) + '"></label></div>' +
         '<div class="row"><label>协议<input id="f-protocol" value="' + esc(p.protocol || 'openai-chat') + '"></label>' +
         '<label>启用<select id="f-enabled"><option value="1"' + (p.enabled ? ' selected' : '') + '>是</option><option value="0"' + (p.enabled ? '' : ' selected') + '>否</option></select></label></div>' +
-        '<div class="row"><label>base_url<input id="f-base" value="' + esc(p.base_url) + '"></label></div>' +
+        '<div class="row"><label>base_url<input id="f-base" value="' + esc(p.base_url) + '"></label>' +
+        '<label>权重<input id="f-weight" type="number" min="0" step="1" value="' + (Number(p.weight) || 0) + '"></label></div>' +
+        '<p class="muted">权重只影响本页排序：大的排在前面，同权重保持原有顺序，停用的产品一律排最后。</p>' +
         '<div class="row"><label>产品后台 url<input id="f-console-url" value="' + esc(p.console_url || '') + '" placeholder="http://127.0.0.1:7863/admin"></label></div>' +
         '<p class="muted">产品自己的管理后台地址，只用于列表里点产品名跳过去（新标签页）；留空则产品名不可点。</p>' +
         '<div class="row"><label>chat_path<input id="f-chat-path" value="' + esc(p.chat_path || '') + '" placeholder="/v1/chat/completions"></label>' +
@@ -1193,6 +1216,7 @@
           protocol: document.getElementById('f-protocol').value.trim() || 'openai-chat',
           enabled: document.getElementById('f-enabled').value === '1',
           base_url: document.getElementById('f-base').value.trim(),
+          weight: Math.max(0, Number(document.getElementById('f-weight').value) || 0),
           console_url: document.getElementById('f-console-url').value.trim(),
           api_key: document.getElementById('f-key').value.trim(),
           timeout: {
@@ -1312,18 +1336,24 @@
 
     function newMember(productId, modelName) {
       const weights = (draft && draft.members ? draft.members : []).map(m => Number(m.weight) || 0);
+      // 默认产品也取「已启用」的第一个：默认值指到停用产品等于让用户多点一次下拉。
       return {
-        product: productId || (products[0] || {}).id || '',
+        product: productId || (activeProducts()[0] || products[0] || {}).id || '',
         model: modelName || '',
         weight: weights.length ? Math.max(10, Math.min.apply(null, weights) - 10) : 100,
         enabled: true, effective: { start: '', end: '' }, daily: { start: '', end: '' },
       };
     }
 
-    // 添加成员的候选池：把每个产品已拉取到的模型摊平成 (产品, 模型) 列表。
+    // 添加成员的候选池：把每个「已启用」产品已拉取到的模型摊平成 (产品, 模型) 列表。
+    // 停用产品的模型不进候选：选进组也永远不会被选路命中，只会让组看着有成员却跑不通。
+    function activeProducts() {
+      return products.filter(product => product.enabled !== false);
+    }
+
     function catalogEntries() {
       const entries = [];
-      products.forEach(product => {
+      activeProducts().forEach(product => {
         (modelCache[product.id] || []).forEach(model => entries.push({ product: product.id, model }));
       });
       return entries;
@@ -1335,19 +1365,29 @@
       const query = document.getElementById('ge-add-q');
       const keyword = ((query && query.value) || '').trim().toLowerCase();
       const catalog = catalogEntries();
-      // 已在组内的成员不再出现在候选里；搜索也只搜「还能加的」。
       const members = (draft && draft.members) || [];
-      const available = catalog.filter(item => !members.some(
-        member => member.product === item.product && member.model === item.model));
-      const entries = available.filter(item => !keyword || (item.product + '/' + item.model).toLowerCase().includes(keyword));
-      select.innerHTML = entries.map(item =>
-        '<option value="' + esc(item.product + '|' + item.model) + '">' + esc(item.product + ' · ' + item.model) + '</option>').join('');
+      // 同一模型允许重复添加（用每日时段区分），所以候选里不再剔除已配置的；
+      // 但已配置的排在最后并加「（已配置）」后缀，避免和还没配过的混在一起。
+      const used = new Set(members.map(m => m.product + '|' + m.model));
+      const matched = catalog.filter(item => !keyword || (item.product + '/' + item.model).toLowerCase().includes(keyword));
+      const fresh = matched.filter(item => !used.has(item.product + '|' + item.model));
+      const reused = matched.filter(item => used.has(item.product + '|' + item.model));
+      const option = item => {
+        const value = item.product + '|' + item.model;
+        const label = item.product + ' · ' + item.model + (used.has(value) ? '（已配置）' : '');
+        return '<option value="' + esc(value) + '">' + esc(label) + '</option>';
+      };
+      select.innerHTML =
+        (fresh.length ? '<optgroup label="未配置">' + fresh.map(option).join('') + '</optgroup>' : '') +
+        (reused.length ? '<optgroup label="已配置过（可重复添加，按时段区分）">' + reused.map(option).join('') + '</optgroup>' : '');
       const hint = document.getElementById('ge-add-hint');
       if (hint) {
-        if (!catalog.length) hint.textContent = '模型目录还没拉到，可先用「手工填一个」';
-        else if (!available.length) hint.textContent = '该组已包含全部模型';
-        else if (!entries.length) hint.textContent = '没有匹配的模型（已添加的不会再出现）';
-        else hint.textContent = entries.length + ' / ' + available.length + ' 个可添加';
+        if (!activeProducts().length) hint.textContent = '没有启用的产品：先到「产品」页启用一个，再来加成员';
+        else if (!catalog.length) hint.textContent = '模型目录还没拉到，可先用「手工填一个」';
+        else if (!matched.length) hint.textContent = '没有匹配的模型';
+        else hint.textContent = matched.length + ' 个模型' +
+          (reused.length ? '（' + reused.length + ' 个已配置，排在最后）' : '') +
+          '；同一模型可重复添加，用每日时段区分';
       }
     }
 
@@ -1374,6 +1414,7 @@
           '<select class="me-product"' + (locked ? ' disabled' : '') + lockHint + '>' + productSelect(m.product) + '</select>' +
           '<input class="me-model" list="models-' + esc(m.product) + '" value="' + esc(m.model) + '" placeholder="模型名（可直接手填）"' + (locked ? ' readonly' : '') + lockHint + '>' +
           chip(esc(tag[0]), tag[1]) +
+          (dailyOn && daily.start && daily.end ? chip(esc(daily.start + '-' + daily.end), 'off') : '') +
         '</div>' +
         '<div class="m-sub">' +
           '<label>权重 <input class="me-weight" type="number" min="1" value="' + esc(m.weight) + '"></label>' +
@@ -1435,7 +1476,8 @@
     }
 
     function syncModelCache() {
-      products.forEach(product => {
+      // 只给启用的产品拉目录：停用产品既不进候选，也没必要为它打一次上游。
+      activeProducts().forEach(product => {
         if (modelCache[product.id]) return;
         api('/catalog/fetch?product=' + encodeURIComponent(product.id))
           .then(payload => {
@@ -1639,13 +1681,16 @@
         const select = document.getElementById('ge-cands');
         const picked = Array.from(select.selectedOptions).map(node => node.value);
         if (!picked.length) { toast('先在候选列表里选中模型'); return; }
+        let reused = 0;
         picked.forEach(value => {
           const parts = value.split('|');
           const product = parts[0];
           const model = parts.slice(1).join('|');
-          if (draft.members.some(m => m.product === product && m.model === model)) return;
+          // 同模型允许重复添加；已配过的记一笔，加完统一提示去设时段。
+          if (draft.members.some(m => m.product === product && m.model === model)) reused++;
           draft.members.push(newMember(product, model));
         });
+        if (reused) toast('有 ' + reused + ' 个模型已在组内：同名成员共享冷却状态，建议用每日时段区分用途');
         renumberWeights();   // 追加后按顺序重排权重，保持“顺序即优先级”不出现并列
         renderGroupEditor();
       };
@@ -1711,6 +1756,8 @@
       ok: ['可用', 'ok'],
       cooldown: ['冷却中', 'warn'],
       breaker: ['熔断中', 'err'],
+      // 熔断已到期、半开探测名额被某个在途请求占着：此时同样不参与选路。
+      probing: ['探测中', 'warn'],
       window_out: ['时段外', 'warn'],
       product_disabled: ['产品停用', 'off'],
       product_missing: ['产品缺失', 'err'],
@@ -2216,15 +2263,23 @@
       const note = document.getElementById('model-note');
       if (!body) return;
       const productFilter = (document.getElementById('model-product') || {}).value || '';
+      const stateFilter = (document.getElementById('model-state') || {}).value || 'all';
       const keyword = ((document.getElementById('model-q') || {}).value || '').trim().toLowerCase();
       // 停用的产品服务端已不返回；这里再兜一层，避免旧响应残留在 modelRows 里。
       const rows = modelRows.filter(row => row.enabled !== false)
         .filter(row => !productFilter || row.id === productFilter);
+      // 状态过滤与行渲染同源：都按该产品的 disabled 集合判断，不另算一套。
+      const keepByState = (disabled, id) => stateFilter === 'all'
+        || (stateFilter === 'off' ? disabled.has(id) : !disabled.has(id));
       let total = 0;
       let off = 0;
       const html = rows.map(row => {
-        const models = (row.models || []).filter(id => !keyword || id.toLowerCase().includes(keyword));
         const disabled = new Set(row.disabled || []);
+        const models = (row.models || []).filter(id =>
+          (!keyword || id.toLowerCase().includes(keyword)) && keepByState(disabled, id));
+        // 「仅启用 / 仅停用」是视图切换：整组没有命中项时连组头一起藏掉，
+        // 否则只停用了两三个模型时，一屏全是「0 个模型」的组标题。
+        if (!models.length && stateFilter !== 'all') return '';
         total += models.length;
         if (!models.length) {
           return '<tr class="group-head"><td colspan="6">' + esc(row.name || row.id) +
@@ -2251,11 +2306,18 @@
               '</tr>';
           }).join('');
       }).join('');
-      body.innerHTML = html || '<tr class="card"><td colspan="6"><div class="empty"><b>没有模型</b>点「刷新（回源）」拉一次上游；停用的产品不会出现在这里。</div></td></tr>';
+      // 空态要区分「一个模型都没有」与「筛选没命中」：前者去刷新，后者换条件。
+      const hasFilter = keyword !== '' || stateFilter !== 'all';
+      body.innerHTML = html || '<tr class="card"><td colspan="6"><div class="empty">' +
+        (hasFilter
+          ? '<b>没有匹配的模型</b>换个关键字或状态再试。'
+          : '<b>没有模型</b>点「刷新（回源）」拉一次上游；停用的产品不会出现在这里。') +
+        '</div></td></tr>';
       if (note) {
         const withModels = rows.filter(row => (row.count || 0) > 0).length;
+        const stateText = stateFilter === 'all' ? '' : (stateFilter === 'off' ? ' · 只看停用' : ' · 只看启用');
         note.textContent = rows.length + ' 个启用产品 · ' + total + ' 个模型命中' +
-          (off ? '（停用 ' + off + '）' : '') + ' · 已缓存 ' + withModels + ' 个产品' +
+          (off ? '（停用 ' + off + '）' : '') + stateText + ' · 已缓存 ' + withModels + ' 个产品' +
           '（缓存 10 分钟内直接读文件）';
       }
     }
@@ -2417,7 +2479,22 @@
       if (cancel) cancel.onclick = closeDrawer;
     }
     function closeDrawer() { document.getElementById('drawer').classList.remove('show'); drawerSave = null; }
-    document.getElementById('drawer').addEventListener('click', event => { if (event.target.id === 'drawer') closeDrawer(); });
+    // 点遮罩关闭必须是「按下和松开都在遮罩上」：在输入框里拖选文字时，
+    // 一不小心把鼠标划到遮罩上松手，浏览器会把 click 派发到公共祖先 #drawer，
+    // event.target 正好是遮罩，抽屉就被关掉、选中的内容也丢了。
+    let drawerMaskPressed = false;
+    const drawerNode = document.getElementById('drawer');
+    drawerNode.addEventListener('mousedown', event => { drawerMaskPressed = event.target === drawerNode; });
+    drawerNode.addEventListener('click', event => {
+      const onMask = event.target === drawerNode;
+      const pressedOnMask = drawerMaskPressed;
+      drawerMaskPressed = false;
+      if (!onMask || !pressedOnMask) return;
+      // 遮罩上真划选了一段文字（多半是想复制日志/参数）时也不关。
+      const selection = window.getSelection && window.getSelection();
+      if (selection && !selection.isCollapsed && String(selection).length > 0) return;
+      closeDrawer();
+    });
 
     document.addEventListener('click', event => {
       const target = event.target.closest('[data-act]');
@@ -2476,6 +2553,7 @@
     };
     document.getElementById('model-refresh').onclick = () => refreshModels();
     document.getElementById('model-product').onchange = () => renderModels();
+    document.getElementById('model-state').onchange = () => renderModels();
     document.getElementById('model-q').addEventListener('input', () => renderModels());
     document.getElementById('settings-save').onclick = () => saveSettings();
 

@@ -109,6 +109,9 @@ type Product struct {
 	// 放在配置里而不是运行态：刷新模型目录时无需迁移，重启、备份、回滚都跟着走。
 	DisabledModels []string `json:"disabled_models,omitempty"`
 	Note           string   `json:"note"`
+	// Weight 只决定面板里的排列顺序（大的靠前，同权重保持配置顺序，停用的一律排最后），
+	// 不参与转发、探活与选路——产品之间没有优先级语义，选路看的是模型组成员的 weight。
+	Weight int `json:"weight,omitempty"`
 }
 
 // ModelDisabled 判断某个模型 id 是否被停用。精确匹配（区分 cn: / global: 前缀）：
@@ -542,6 +545,10 @@ func Validate(cfg *Config) error {
 		if err := ValidateConsoleURL(p.ConsoleURL); err != nil {
 			return fmt.Errorf("产品 %s：%w", p.ID, err)
 		}
+		// 权重只用于面板排序，负值没有意义（排序方向会反过来，容易看懵）。
+		if p.Weight < 0 {
+			return fmt.Errorf("产品 %s 的权重不能为负", p.ID)
+		}
 		products[p.ID] = p
 	}
 
@@ -556,7 +563,6 @@ func Validate(cfg *Config) error {
 		}
 		groups[name] = struct{}{}
 
-		seen := make(map[string]struct{}, len(g.Members))
 		for _, m := range g.Members {
 			if strings.TrimSpace(m.Model) == "" {
 				return fmt.Errorf("%w：组 %s 存在空模型名", ErrInvalidGroup, name)
@@ -567,11 +573,10 @@ func Validate(cfg *Config) error {
 			if m.Weight <= 0 {
 				return fmt.Errorf("%w：组 %s 的成员 %s 权重必须为正", ErrInvalidGroup, name, m.Model)
 			}
-			key := memberKey(name, m.Product, m.Model)
-			if _, dup := seen[key]; dup {
-				return fmt.Errorf("%w：组 %s 成员重复 %s|%s", ErrInvalidGroup, name, m.Product, m.Model)
-			}
-			seen[key] = struct{}{}
+			// 这里刻意不限制成员重复：同一产品同一模型可以配多条，通常用「每日时段」
+			// 区分白天/夜间；完全相同的两行也放行（用户可能先配好再逐条改时段）。
+			// 重复行不会放大故障：运行态按 组|产品|模型 共享冷却与熔断，同一次请求
+			// 也只会尝试其中一个（已试成员按同一 key 排除）。
 
 			start, hasStart, err := ParseTime(m.Effective.Start)
 			if err != nil {
@@ -666,12 +671,34 @@ func SaveAtomic(path string, cfg *Config) error {
 	return os.Rename(tmp, path)
 }
 
+// ReadVersion 只解析配置文件里的 version 字段，不做任何校验。
+//
+// 版本探测与「配置是否合法」必须分开：磁盘上的旧配置一旦有一处不合法
+// （手改 weight 为 0、残留明文 admin_token 等），用 Load 做探测会让每次保存
+// 都在第一步失败并返回旧文件的校验错误——面板无法保存，用户只能去改文件，
+// 而配置被改坏恰恰是最需要面板兜底的时刻。
+func ReadVersion(path string) (int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
+	var head struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &head); err != nil {
+		return 0, fmt.Errorf("配置不是合法 JSON：%w", err)
+	}
+	return head.Version, nil
+}
+
 // SaveWithVersion 按乐观锁保存：磁盘版本与 expect 不一致时返回 ErrVersionConflict。
+// 冲突判定只读 version 字段；待写入的新配置由 SaveAtomic 里的 Validate 把关。
 func SaveWithVersion(path string, cfg *Config, expect int) error {
-	current, err := Load(path)
+	current, err := ReadVersion(path)
 	switch {
 	case err == nil:
-		if current.Version != expect {
+		if current != expect {
 			return ErrVersionConflict
 		}
 	case errors.Is(err, os.ErrNotExist):

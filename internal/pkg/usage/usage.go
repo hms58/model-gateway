@@ -69,6 +69,19 @@ type bucket struct {
 	CM      int64  `json:"cm,omitempty"` // prompt 缓存未命中 token
 	LatMs   int64  `json:"l"`            // 成功请求的耗时累计（ms）
 	LatN    int64  `json:"ln"`           // 成功请求的耗时样本数
+
+	// ts / day 是 Scope 的解析结果缓存（不落盘）：Add 与 Rollup 时已经知道时间，
+	// 聚合时就不必对上万个 scope 反复做时间解析——这是统计页最主要的 CPU 开销。
+	ts  time.Time
+	day string
+}
+
+// time 返回桶所属时间片；脏 scope 返回 false（不进任何口径）。
+func (b *bucket) time() (time.Time, bool) {
+	if !b.ts.IsZero() {
+		return b.ts, true
+	}
+	return bucketTime(b.Scope)
 }
 
 // file 落盘结构。
@@ -178,7 +191,9 @@ func (r *Recorder) Add(now time.Time, product, model string, d Delta, ok bool) {
 	}
 	// 时区与请求日志、配置里的时间窗统一用 config.Location()：
 	// 统计页的「某天」必须和日志页按天分文件的口径一致，否则跨零点会对不上账。
-	scope := "h:" + now.In(config.Location()).Format(hourLayout)
+	local := now.In(config.Location())
+	hour := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, config.Location())
+	scope := "h:" + hour.Format(hourLayout)
 	key := scope + "|" + product + "|" + model
 
 	r.mu.Lock()
@@ -186,7 +201,10 @@ func (r *Recorder) Add(now time.Time, product, model string, d Delta, ok bool) {
 
 	b := r.buckets[key]
 	if b == nil {
-		b = &bucket{Scope: scope, Product: product, Model: model}
+		b = &bucket{
+			Scope: scope, Product: product, Model: model,
+			ts: hour, day: hour.Format(dayLayout),
+		}
 		r.buckets[key] = b
 	}
 	b.Req++
@@ -247,8 +265,8 @@ func (r *Recorder) Rollup(now time.Time) {
 		if !strings.HasPrefix(b.Scope, "h:") {
 			continue
 		}
-		ts, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(b.Scope, "h:"), config.Location())
-		if err != nil {
+		ts, ok := b.time()
+		if !ok {
 			continue
 		}
 		day := "d:" + ts.Format(dayLayout)
@@ -270,6 +288,8 @@ func (r *Recorder) Rollup(now time.Time) {
 		if dst == nil {
 			cp := *src
 			cp.Scope = strings.SplitN(m.to, "|", 2)[0]
+			// 折叠后时间片从「小时」变成「日」，缓存必须一起改，否则聚合会按小时判窗口。
+			cp.ts, cp.day = dayStart(m.ts), m.ts.Format(dayLayout)
 			dst = &cp
 			r.buckets[m.to] = dst
 		} else {
@@ -308,6 +328,10 @@ func (r *Recorder) load() error {
 	}
 	for i := range f.Buckets {
 		b := f.Buckets[i]
+		// 时间缓存不落盘，加载时统一补一次，运行期聚合便不再解析 scope。
+		if ts, ok := bucketTime(b.Scope); ok {
+			b.ts, b.day = ts, ts.Format(dayLayout)
+		}
 		r.buckets[b.Scope+"|"+b.Product+"|"+b.Model] = &b
 	}
 	log.Printf("[usage] 已恢复 %d 个用量桶（%s）", len(r.buckets), r.path)
@@ -497,30 +521,29 @@ func (r *Recorder) Snapshot(w Window) Snapshot {
 	from, to := w.bounds(now)
 	windowed := !from.IsZero() || !to.IsZero()
 
-	r.mu.Lock()
-	bs := make([]bucket, 0, len(r.buckets))
-	for _, b := range r.buckets {
-		bs = append(bs, *b)
-	}
-	r.mu.Unlock()
-
 	var total acc
 	pmAgg := map[string]*acc{}
 	dayAgg := map[string]*acc{}
 	since := ""
 	matched := 0
 
-	for i := range bs {
-		b := &bs[i]
+	// 直接持锁聚合，不再先把所有桶复制一份：复制 20 万个桶是每次查询 20MB 级的临时分配，
+	// 而这里只做累加，锁内工作量比「复制 + 解锁后解析聚合」更小。
+	// 桶的时间片在 Add / Rollup / load 时已算好，聚合阶段不再解析 scope。
+	r.mu.Lock()
+	for _, b := range r.buckets {
 		if since == "" || b.Scope < since {
 			since = b.Scope
 		}
-		ts, ok := bucketTime(b.Scope)
+		ts, ok := b.time()
 		if !ok {
 			// 解析失败的脏桶不进任何口径（也不该出现在趋势里）。
 			continue
 		}
-		day := ts.Format(dayLayout)
+		day := b.day
+		if day == "" {
+			day = ts.Format(dayLayout)
+		}
 		if windowed {
 			if !from.IsZero() && ts.Before(from) {
 				continue
@@ -543,6 +566,7 @@ func (r *Recorder) Snapshot(w Window) Snapshot {
 		}
 		dayAgg[day].add(b)
 	}
+	r.mu.Unlock()
 
 	snap := Snapshot{
 		Totals:         total.finish(),

@@ -2,9 +2,9 @@ package router
 
 import (
 	"errors"
-	"math/rand"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -163,6 +163,40 @@ func (s *State) NoteProductError(id, message string) {
 	s.products[id].LastError = message
 }
 
+// ForgetProduct 清掉某产品的健康摘要，以及引用它的成员运行态。
+// 产品删除后这些状态不再有意义；留着会让面板继续展示已不存在产品的冷却与失败记录，
+// 也会让重建同名产品时继承上一条（早已无关的）冷却。
+func (s *State) ForgetProduct(id string) {
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.products, id)
+	for key := range s.members {
+		if memberProductOf(key) != id {
+			continue
+		}
+		delete(s.members, key)
+		delete(s.probes, key)
+		for sessionKey, entry := range s.sticky {
+			if entry.key == key {
+				delete(s.sticky, sessionKey)
+			}
+		}
+	}
+}
+
+// memberProductOf 从成员键 group|product|model 里取产品 id。
+// 模型名可能含 '|'，所以只切前两段。
+func memberProductOf(key string) string {
+	parts := strings.SplitN(key, "|", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[1]
+}
+
 // NoteTokenUse 累加 Token 使用次数并刷新最近使用时间。
 func (s *State) NoteTokenUse(id string) {
 	if id == "" {
@@ -213,7 +247,7 @@ func (s *State) Success(key string) {
 
 // MemberStatus 是面板展示用的成员可用性摘要。
 type MemberStatus struct {
-	State      string `json:"state"` // ok | cooldown | breaker
+	State      string `json:"state"` // ok | cooldown | breaker | probing
 	Reason     string `json:"reason,omitempty"`
 	UnlockAt   string `json:"unlock_at,omitempty"`
 	LastOKAt   string `json:"last_ok_at,omitempty"`
@@ -222,6 +256,9 @@ type MemberStatus struct {
 }
 
 // StatusOf 计算成员当前是否参与选路，以及被摘除的原因与解除时间。
+//
+// 熔断已到期但半开探测名额仍被占用时报告 probing：这个状态下成员同样不参与选路，
+// 若报成 ok，面板会显示「正常却打不过去」，后台探活也会因为只探异常成员而跳过它。
 func (s *State) StatusOf(key string) MemberStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -234,9 +271,21 @@ func (s *State) StatusOf(key string) MemberStatus {
 		ProbedAt: item.ProbedAt, FailStreak: item.FailStreak,
 	}
 	now := s.now()
-	if until := parseTime(item.BreakerUntil); !until.IsZero() && until.After(now) {
-		out.State, out.UnlockAt = "breaker", item.BreakerUntil
-		return out
+	if until := parseTime(item.BreakerUntil); !until.IsZero() {
+		if until.After(now) {
+			out.State, out.UnlockAt = "breaker", item.BreakerUntil
+			if out.Reason == "" {
+				out.Reason = "上游连续失败"
+			}
+			return out
+		}
+		if s.probes[key] {
+			out.State = "probing"
+			if out.Reason == "" {
+				out.Reason = "半开探测进行中"
+			}
+			return out
+		}
 	}
 	if until := parseTime(item.CooldownUntil); until.After(now) {
 		out.State, out.UnlockAt = "cooldown", item.CooldownUntil
@@ -382,6 +431,7 @@ func (s *State) Available(key string) bool {
 
 // ClaimProbe 为熔断已到期的成员抢占半开探测名额，只对实际选中的成员调用。
 // 非半开成员不占名额；抢占失败说明名额已被其它请求拿走，应换下一个候选。
+// 抢占成功的调用方必须 defer ReleaseProbe(key)：请求以任何方式结束都要归还名额。
 func (s *State) ClaimProbe(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -398,6 +448,18 @@ func (s *State) ClaimProbe(key string) bool {
 	}
 	s.probes[key] = true
 	return true
+}
+
+// ReleaseProbe 归还半开探测名额；幂等，非半开成员上调用无副作用。
+// 与 ClaimProbe 成对使用：探测失败（冷却/计数分支）与客户端断开都不会走
+// Success/Probe，不显式归还会让名额永久占用，成员从此既不被选中也不被探活。
+func (s *State) ReleaseProbe(key string) {
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.probes, key)
 }
 
 // BindSticky 记录会话命中，TTL 内优先复用。
@@ -523,19 +585,19 @@ func inDailyWindow(window config.DailyWindow, now time.Time) bool {
 }
 
 // Pick 选出一个成员并返回其唯一键；不需要排除已试成员时用它。
-func Pick(cfg *config.Config, st *State, groupName, sessionKey string, rnd *rand.Rand) (config.Member, string, error) {
-	return PickExcluding(cfg, st, groupName, sessionKey, nil, rnd)
+func Pick(cfg *config.Config, st *State, groupName, sessionKey string) (config.Member, string, error) {
+	return PickExcluding(cfg, st, groupName, sessionKey, nil)
 }
 
 // PickExcluding 在候选过滤阶段剔除本次请求已尝试过的成员。
 // 排除必须发生在选路内部：Pick 每次都返回权重最高的可用成员，若靠调用方
 // 「选完再判重」，冷却在长超时期间过期后已试成员会重新被选中，
 // 被误判成「无可用成员」而提前断掉整条降级链。
+//
+// 不接受随机源：选路完全由 weight 与列表顺序决定（无随机抽取），
+// 调用方不必为「选路要不要随机」额外持锁串行化整个请求。
 func PickExcluding(cfg *config.Config, st *State, groupName, sessionKey string,
-	excluded map[string]struct{}, rnd *rand.Rand) (config.Member, string, error) {
-	if rnd == nil {
-		rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
-	}
+	excluded map[string]struct{}) (config.Member, string, error) {
 	var group *config.Group
 	for i := range cfg.ModelGroups {
 		if cfg.ModelGroups[i].Name == groupName {

@@ -139,7 +139,11 @@ func (s *Server) products(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, CodeInvalidParam, "product 字段不可解析")
 			return
 		}
-		if err := s.saveProduct(product, req.Version); err != nil {
+		// 记下本次请求实际带了哪些字段：面板只提交表单里可见的项，
+		// 没带的字段（停用模型 / 自定义头 / 备注）必须沿用旧值，不能被零值覆盖。
+		provided := make(map[string]json.RawMessage)
+		_ = json.Unmarshal(req.Product, &provided)
+		if err := s.saveProduct(product, req.Version, provided); err != nil {
 			writeSaveError(w, err)
 			return
 		}
@@ -149,7 +153,7 @@ func (s *Server) products(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) saveProduct(product config.Product, version int) error {
+func (s *Server) saveProduct(product config.Product, version int, provided map[string]json.RawMessage) error {
 	cfg := s.store.Snapshot().Clone()
 	if strings.TrimSpace(product.ID) == "" {
 		return &apiError{http.StatusBadRequest, CodeInvalidParam, "产品 id 不能为空"}
@@ -157,17 +161,29 @@ func (s *Server) saveProduct(product config.Product, version int) error {
 	replaced := false
 	for i := range cfg.Products {
 		if cfg.Products[i].ID == product.ID {
+			previous := cfg.Products[i]
 			// 面板回填的是掩码：留空或等于掩码都表示「不改 key」，保留原值。
 			incoming := strings.TrimSpace(product.APIKey)
-			if incoming == "" || incoming == maskAPIKey(cfg.Products[i].APIKey) {
-				product.APIKey = cfg.Products[i].APIKey
+			if incoming == "" || incoming == maskAPIKey(previous.APIKey) {
+				product.APIKey = previous.APIKey
 			}
 			// 代理密码同理：URL 与掩码一致说明用户没改密码，还原真实值。
 			// 与 api_key 一样，留空也表示「不改」；用户想停用代理应关 enabled，
 			// 而不是把 URL 清空后指望它变直连（旧地址会保留，便于再次启用）。
 			proxyURL := strings.TrimSpace(product.Proxy.URL)
-			if proxyURL == egress.MaskProxyURL(cfg.Products[i].Proxy.URL) {
-				product.Proxy.URL = cfg.Products[i].Proxy.URL
+			if proxyURL == egress.MaskProxyURL(previous.Proxy.URL) {
+				product.Proxy.URL = previous.Proxy.URL
+			}
+			// 这三个字段没有编辑入口（停用列表在模型页维护），请求里没带就沿用旧值：
+			// 否则面板保存一次产品会把停用模型、自定义头、备注一起静默清空。
+			if _, ok := provided["disabled_models"]; !ok {
+				product.DisabledModels = previous.DisabledModels
+			}
+			if _, ok := provided["headers"]; !ok {
+				product.Headers = previous.Headers
+			}
+			if _, ok := provided["note"]; !ok {
+				product.Note = previous.Note
 			}
 			cfg.Products[i] = product
 			replaced = true
@@ -182,6 +198,9 @@ func (s *Server) saveProduct(product config.Product, version int) error {
 	}
 	// 产品地址 / key 变更后旧模型列表不再可信，清缓存避免最长 10 分钟继续用旧数据。
 	s.catalog.Invalidate(product.ID)
+	// 出网 client 也要清：面板保存是全量覆盖，同名产品的 clientKey 可能一字未变，
+	// 不清就会继续用旧代理 / 旧超时配置，且旧连接池（每 host 32 条空闲）永久滞留。
+	egress.Invalidate(product.ID)
 	return nil
 }
 
@@ -222,6 +241,9 @@ func (s *Server) productItem(w http.ResponseWriter, r *http.Request) {
 			writeSaveError(w, err)
 			return
 		}
+		s.catalog.Invalidate(id)
+		egress.Invalidate(id)
+		s.store.State().ForgetProduct(id)
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodPut:
 		var req struct {

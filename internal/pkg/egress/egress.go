@@ -65,13 +65,24 @@ func Client(product config.Product, connect, firstByte, total time.Duration, str
 	return actual.(*http.Client), nil
 }
 
-// Invalidate 清空缓存：产品被删除或配置大幅变更时可调用，避免旧连接长期留存。
-// 正常情况下靠 clientKey 自动区分，配置保存后无需手动调用。
+// Invalidate 清空某产品的 client 缓存，并关闭其空闲连接。
+//
+// Desc 里写的「配置保存后无需手动调用」不成立：面板保存是一次全量覆盖，
+// 删掉再重建同名产品时 clientKey 完全相同，旧 client 会被直接复用；
+// 且每个被淘汰的 client 仍握着最多 32 条空闲连接，不显式关闭就一直占着。
+// 所以产品保存 / 删除时必须调用这里（见 panel.saveProduct 与删除分支）。
 func Invalidate(productID string) {
-	clients.Range(func(key, _ any) bool {
-		if item, ok := key.(clientKey); ok && item.productID == productID {
-			clients.Delete(key)
+	clients.Range(func(key, value any) bool {
+		item, ok := key.(clientKey)
+		if !ok || item.productID != productID {
+			return true
 		}
+		if client, ok := value.(*http.Client); ok {
+			if transport, ok := client.Transport.(*http.Transport); ok {
+				transport.CloseIdleConnections()
+			}
+		}
+		clients.Delete(key)
 		return true
 	})
 }

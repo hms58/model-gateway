@@ -16,10 +16,13 @@ import (
 )
 
 const (
-	// 默认与上限都是 100：日志按天扫全量文件后在内存里排序，
-	// 单页过大既拖慢面板，也失去分页意义。
+	// 默认与上限都是 100：单页过大既拖慢面板，也失去分页意义。
 	defaultPageSize = 100
 	maxPageSize     = 100
+	// maxRetainedEntries 是单次查询在内存里最多保留的条数。
+	// 一页最多 100 条，保留 2 万条足够覆盖 200 页以内的翻页；
+	// 更深的页会按实际需要的条数重扫一次（见 logsList）。
+	maxRetainedEntries = 20000
 )
 
 // WithLogs 指定日志目录（为空时查询接口返回空集）。
@@ -45,7 +48,6 @@ func (s *Server) logsList(w http.ResponseWriter, r *http.Request) {
 		Status:  atoi(query.Get("status"), 0),
 	}
 
-	entries := s.queryLogs(from, to, filter)
 	page := atoi(query.Get("page"), 1)
 	size := atoi(query.Get("size"), defaultPageSize)
 	if page < 1 {
@@ -58,7 +60,16 @@ func (s *Server) logsList(w http.ResponseWriter, r *http.Request) {
 	if size > maxPageSize {
 		size = maxPageSize
 	}
-	total := len(entries)
+
+	// 只保留「翻到这一页所需的最多条数」，而不是整份结果：
+	// 单日可达百万条，全量保留后再排序会让一次翻页把常驻内存顶上去。
+	need := page * size
+	if need > maxRetainedEntries || need < size {
+		need = maxRetainedEntries
+	}
+	window := newEntryWindow(need)
+	total := s.scanLogs(from, to, filter, window.push)
+
 	pages := 0
 	if total > 0 {
 		pages = (total + size - 1) / size
@@ -67,12 +78,19 @@ func (s *Server) logsList(w http.ResponseWriter, r *http.Request) {
 		page = pages // 数据变少时把越界页夹回最后一页，避免返回空列表
 	}
 	start := (page - 1) * size
-	if start > total {
-		start = total
+	if end := start + size; end > window.len() && end <= total {
+		// 深翻页时首轮只保留了上限内的条目：按实际需要的条数重扫一次。
+		window = newEntryWindow(end)
+		s.scanLogs(from, to, filter, window.push)
+	}
+
+	entries := window.newestFirst()
+	if start > len(entries) {
+		start = len(entries)
 	}
 	end := start + size
-	if end > total {
-		end = total
+	if end > len(entries) {
+		end = len(entries)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"total": total, "page": page, "size": size, "pages": pages,
@@ -86,12 +104,14 @@ func (s *Server) logsOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	today := time.Now()
-	entries := s.queryLogs(today, today, logFilter{})
-	total := len(entries)
+	total := 0
 	okCount := 0
 	downgraded := 0
-	durations := make([]int64, 0, total)
-	for _, entry := range entries {
+	durations := make([]int64, 0, 256)
+	// 流式累计而不是先取回整天的 entry 切片：概览只需要计数与耗时，
+	// 保留完整条目会让每次自动刷新都把当日日志全量读进内存。
+	s.scanLogs(today, today, logFilter{}, func(entry reqlog.Entry) {
+		total++
 		if entry.Outcome == "ok" {
 			okCount++
 		}
@@ -99,7 +119,7 @@ func (s *Server) logsOverview(w http.ResponseWriter, r *http.Request) {
 			downgraded++
 		}
 		durations = append(durations, entry.DurationMs)
-	}
+	})
 	rate := 0.0
 	if total > 0 {
 		rate = float64(okCount) / float64(total)
@@ -167,8 +187,28 @@ func (f logFilter) match(entry reqlog.Entry) bool {
 	return true
 }
 
-// queryLogs 扫描日期范围内的按天文件，按时间倒序返回匹配项。
-func (s *Server) queryLogs(from, to time.Time, filter logFilter) []reqlog.Entry {
+// scanLogs 按写入顺序（旧 → 新）逐条回调命中 filter 的日志，返回命中总数。
+//
+// 逐条回调而不是整批返回：调用方只关心计数或最近 N 条，整批驻留内存没有意义。
+func (s *Server) scanLogs(from, to time.Time, filter logFilter, visit func(reqlog.Entry)) int {
+	count := 0
+	for _, path := range s.logFiles(from, to) {
+		readEntries(path, func(entry reqlog.Entry) {
+			if !filter.match(entry) {
+				return
+			}
+			count++
+			visit(entry)
+		})
+	}
+	return count
+}
+
+// logFiles 返回日期范围内的日志文件，按「日期升序 + 同日分片序号升序」排列。
+//
+// 这个顺序就是时间序：日志是追加写的，文件内行序也是时间序，
+// 因此「最新一页」可以在一次顺序扫描里用定长缓冲拿到，不必全量读取后再排序。
+func (s *Server) logFiles(from, to time.Time) []string {
 	if s.logsDir == "" {
 		return nil
 	}
@@ -176,36 +216,102 @@ func (s *Server) queryLogs(from, to time.Time, filter logFilter) []reqlog.Entry 
 	if err != nil {
 		return nil
 	}
-	wanted := map[string]struct{}{}
+	wanted := make(map[string]struct{}, 8)
 	for day := truncateDay(from); !day.After(truncateDay(to)); day = day.AddDate(0, 0, 1) {
-		wanted["requests-"+day.Format("20060102")+".jsonl"] = struct{}{}
+		wanted[day.Format("20060102")] = struct{}{}
 	}
 
-	entries := make([]reqlog.Entry, 0, 128)
+	type logFile struct {
+		path string
+		day  string
+		part int
+	}
+	files := make([]logFile, 0, len(names))
 	for _, name := range names {
-		if _, ok := wanted[name.Name()]; !ok {
+		if name.IsDir() {
 			continue
 		}
-		entries = append(entries, readEntries(filepath.Join(s.logsDir, name.Name()))...)
-	}
-	filtered := entries[:0]
-	for _, entry := range entries {
-		if filter.match(entry) {
-			filtered = append(filtered, entry)
+		day, ok := reqlog.DayOfFile(name.Name())
+		if !ok {
+			continue
 		}
+		if _, want := wanted[day]; !want {
+			continue
+		}
+		part, ok := reqlog.PartOfFile(name.Name())
+		if !ok {
+			continue
+		}
+		files = append(files, logFile{path: filepath.Join(s.logsDir, name.Name()), day: day, part: part})
 	}
-	sort.Slice(filtered, func(i, j int) bool { return filtered[i].Time > filtered[j].Time })
-	return filtered
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].day != files[j].day {
+			return files[i].day < files[j].day
+		}
+		return files[i].part < files[j].part
+	})
+	paths := make([]string, 0, len(files))
+	for _, item := range files {
+		paths = append(paths, item.path)
+	}
+	return paths
 }
 
-func readEntries(path string) []reqlog.Entry {
+// entryWindow 是只保留最近 limit 条的定长环形缓冲。
+// 日志按时间顺序读入，所以直接覆盖最旧的一条即可得到「最新 limit 条」。
+type entryWindow struct {
+	items []reqlog.Entry
+	limit int
+	next  int
+	full  bool
+}
+
+func newEntryWindow(limit int) *entryWindow {
+	if limit < 1 {
+		limit = 1
+	}
+	return &entryWindow{items: make([]reqlog.Entry, 0, limit), limit: limit}
+}
+
+func (w *entryWindow) push(entry reqlog.Entry) {
+	if len(w.items) < w.limit {
+		w.items = append(w.items, entry)
+		w.next = len(w.items) % w.limit
+		return
+	}
+	w.items[w.next] = entry
+	w.next = (w.next + 1) % w.limit
+	w.full = true
+}
+
+func (w *entryWindow) len() int { return len(w.items) }
+
+// newestFirst 返回窗口内按时间倒序（新 → 旧）的条目。
+func (w *entryWindow) newestFirst() []reqlog.Entry {
+	out := make([]reqlog.Entry, 0, len(w.items))
+	if !w.full {
+		for i := len(w.items) - 1; i >= 0; i-- {
+			out = append(out, w.items[i])
+		}
+		return out
+	}
+	for i := 0; i < len(w.items); i++ {
+		out = append(out, w.items[(w.next+i)%len(w.items)])
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// readEntries 逐行解析并回调；解析失败的行跳过，不打断整份文件。
+func readEntries(path string, visit func(reqlog.Entry)) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil
+		return
 	}
 	defer file.Close()
 
-	out := make([]reqlog.Entry, 0, 64)
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
 	for scanner.Scan() {
@@ -217,14 +323,10 @@ func readEntries(path string) []reqlog.Entry {
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			continue
 		}
-		out = append(out, entry)
+		visit(entry)
 	}
-	// 读文件途中出错（截断 / I/O 错误）不能当成「正常读完」：
-	// 保留已成功解析的部分，避免把残缺结果当作完整分页数据。
-	if err := scanner.Err(); err != nil {
-		return out
-	}
-	return out
+	// 读文件途中出错（截断 / I/O 错误）时保留已解析部分：
+	// 已有的结果仍然可用，残缺部分不会凭空产生条目。
 }
 
 func parseDay(raw string, fallback time.Time) time.Time {

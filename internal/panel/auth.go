@@ -36,19 +36,15 @@ func (s *Server) authorized(r *http.Request) bool {
 	return false
 }
 
-// isLoopback 判断请求是否来自本机：优先 X-Forwarded-For 首段（反代场景），
-// 没有该头时看 RemoteAddr。只认回环地址，不认「看起来像内网」的地址。
+// isLoopback 判断请求是否来自本机，只认 TCP 对端地址。
+//
+// 刻意不采信 X-Forwarded-For：该头完全由客户端控制，而这里决定的是「未设口令时
+// 谁能拿到管理面」——管理面可改 base_url，一旦被伪造成回环就等于把上游 api_key
+// 引到攻击者地址。反代场景请设好口令（口令校验与来源无关），不要靠伪造头放行。
 func isLoopback(r *http.Request) bool {
-	host := ""
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		host = strings.TrimSpace(strings.Split(forwarded, ",")[0])
-	}
-	if host == "" {
-		if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			host = h
-		} else {
-			host = r.RemoteAddr
-		}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()

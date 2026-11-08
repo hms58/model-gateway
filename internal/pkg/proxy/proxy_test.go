@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -166,6 +167,33 @@ func TestStreamCopyParsesUsageTokens(t *testing.T) {
 	}
 	if usage.PromptTokens != 11 || usage.CompletionTokens != 22 || usage.TotalTokens != 33 {
 		t.Fatalf("usage 解析错误：%+v", usage)
+	}
+}
+
+// 上游异常时可能回一整行超大 JSON（或长流里始终没有换行）：
+// 出站响应必须有单行上限，否则整行会被读进内存（入站已有 32MB 限制，出站此前没有）。
+func TestStreamCopyRejectsOversizedLine(t *testing.T) {
+	recorder := &flushRecorder{header: http.Header{}}
+	oversized := "data: " + strings.Repeat("a", maxLineBytes+1024)
+	if _, err := StreamCopy(recorder, strings.NewReader(oversized), recorder); !errors.Is(err, ErrLineTooLong) {
+		t.Fatalf("超长单行应返回 ErrLineTooLong，实际 %v", err)
+	}
+}
+
+// 非流式响应本身就是单行大 JSON：远超初始缓冲但未超上限时必须完整转发并解析 usage。
+func TestStreamCopyHandlesLongLegalLine(t *testing.T) {
+	recorder := &flushRecorder{header: http.Header{}}
+	payload := `{"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33},"pad":"` +
+		strings.Repeat("x", 200<<10) + `"}`
+	usage, err := StreamCopy(recorder, strings.NewReader(payload), recorder)
+	if err != nil {
+		t.Fatalf("合法长行不应报错：%v", err)
+	}
+	if usage.PromptTokens != 11 || usage.TotalTokens != 33 {
+		t.Fatalf("长行也要解析出 usage：%+v", usage)
+	}
+	if recorder.body.Len() != len(payload) {
+		t.Fatalf("长行必须完整转发：期望 %d 字节，实际 %d", len(payload), recorder.body.Len())
 	}
 }
 

@@ -2,7 +2,6 @@ package router
 
 import (
 	"errors"
-	"math/rand"
 	"testing"
 	"time"
 
@@ -52,7 +51,7 @@ func TestPickEffectiveWindowBoundary(t *testing.T) {
 			}}
 			now := mustParse(t, tc.now)
 			st := NewState(func() time.Time { return now })
-			_, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1)))
+			_, _, err := Pick(cfg, st, "gpt-5", "")
 			if tc.want && err != nil {
 				t.Fatalf("边界内应可选中：%v", err)
 			}
@@ -74,9 +73,8 @@ func TestPickPrefersHigherWeight(t *testing.T) {
 		},
 	}}
 	st := NewState(func() time.Time { return mustParse(t, "2026-11-15 12:00:00") })
-	rnd := rand.New(rand.NewSource(7))
 	for i := 0; i < 50; i++ {
-		member, _, err := Pick(cfg, st, "gpt-5", "", rnd)
+		member, _, err := Pick(cfg, st, "gpt-5", "")
 		if err != nil {
 			t.Fatalf("选路失败：%v", err)
 		}
@@ -99,7 +97,7 @@ func TestPickEqualWeightKeepsListOrder(t *testing.T) {
 	}}
 	st := NewState(func() time.Time { return mustParse(t, "2026-11-15 12:00:00") })
 	for i := 0; i < 20; i++ {
-		member, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(int64(i))))
+		member, _, err := Pick(cfg, st, "gpt-5", "")
 		if err != nil {
 			t.Fatalf("选路失败：%v", err)
 		}
@@ -124,7 +122,7 @@ func TestPreferLastOKDoesNotCrossWeight(t *testing.T) {
 	st := NewState(func() time.Time { return now })
 	st.Success("gpt-5|trae|low")
 
-	member, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1)))
+	member, _, err := Pick(cfg, st, "gpt-5", "")
 	if err != nil {
 		t.Fatalf("选路失败：%v", err)
 	}
@@ -144,7 +142,7 @@ func TestPickSkipsCooldownMember(t *testing.T) {
 	key := config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[0])
 	st.Failure(key, cfg.Routing.Cooldown)
 
-	if _, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1))); !errors.Is(err, ErrNoMember) {
+	if _, _, err := Pick(cfg, st, "gpt-5", ""); !errors.Is(err, ErrNoMember) {
 		t.Fatalf("冷却期应无候选，实际 %v", err)
 	}
 }
@@ -162,17 +160,53 @@ func TestBreakerHalfOpenAllowsSingleProbe(t *testing.T) {
 	key := config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[0])
 	st.Failure(key, cfg.Routing.Cooldown)
 
-	if _, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1))); !errors.Is(err, ErrNoMember) {
+	if _, _, err := Pick(cfg, st, "gpt-5", ""); !errors.Is(err, ErrNoMember) {
 		t.Fatalf("熔断打开期应无候选，实际 %v", err)
 	}
 
 	now = now.Add(2 * time.Second)
-	if _, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1))); err != nil {
+	if _, _, err := Pick(cfg, st, "gpt-5", ""); err != nil {
 		t.Fatalf("半开应放行一个探测：%v", err)
 	}
-	if _, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1))); !errors.Is(err, ErrNoMember) {
+	if _, _, err := Pick(cfg, st, "gpt-5", ""); !errors.Is(err, ErrNoMember) {
 		t.Fatalf("探测令牌只放行一次，实际 %v", err)
 	}
+}
+
+// 探测名额必须可归还：请求以 401/断开等「既不算成功也不算失败」的方式结束时，
+// 不归还会让成员永久停在名额被占状态，既不被选中也不被探活。
+func TestReleaseProbeFreesHalfOpenSlot(t *testing.T) {
+	cfg := baseCfg()
+	cooldown := config.Cooldown{Base: "2s", Max: "60s", FailThreshold: 1, OpenDuration: "1s"}
+	cfg.Routing.Cooldown = cooldown
+	cfg.ModelGroups = []config.Group{{
+		Name: "gpt-5", Enabled: true,
+		Members: []config.Member{{Product: "workbuddy", Model: "gpt-5", Weight: 100, Enabled: true}},
+	}}
+	now := mustParse(t, "2026-11-15 12:00:00")
+	st := NewState(func() time.Time { return now })
+	key := config.MemberKey("gpt-5", cfg.ModelGroups[0].Members[0])
+	st.Failure(key, cooldown)
+	now = now.Add(2 * time.Second)
+
+	if _, _, err := Pick(cfg, st, "gpt-5", ""); err != nil {
+		t.Fatalf("半开应放行一个探测：%v", err)
+	}
+	if _, _, err := Pick(cfg, st, "gpt-5", ""); !errors.Is(err, ErrNoMember) {
+		t.Fatalf("名额占用期间不应再被选中，实际 %v", err)
+	}
+	// 探测状态必须可观测：报成 ok 会让面板与 prober 都以为它正常。
+	if got := st.StatusOf(key).State; got != "probing" {
+		t.Fatalf("名额占用期间状态应为 probing，实际 %s", got)
+	}
+
+	st.ReleaseProbe(key)
+	if _, _, err := Pick(cfg, st, "gpt-5", ""); err != nil {
+		t.Fatalf("归还名额后应重新可探测：%v", err)
+	}
+	// 幂等：重复归还（例如成功路径已清）不应报错或误删其它状态。
+	st.ReleaseProbe(key)
+	st.ReleaseProbe("")
 }
 
 func TestPickHonoursStickySession(t *testing.T) {
@@ -188,7 +222,7 @@ func TestPickHonoursStickySession(t *testing.T) {
 	st := NewState(func() time.Time { return now })
 	st.BindSticky("session-1", "gpt-5|trae|backup", time.Minute)
 
-	member, _, err := Pick(cfg, st, "gpt-5", "session-1", rand.New(rand.NewSource(1)))
+	member, _, err := Pick(cfg, st, "gpt-5", "session-1")
 	if err != nil {
 		t.Fatalf("选路失败：%v", err)
 	}
@@ -200,7 +234,7 @@ func TestPickHonoursStickySession(t *testing.T) {
 func TestPickRejectsUnknownGroup(t *testing.T) {
 	cfg := baseCfg()
 	st := NewState(nil)
-	if _, _, err := Pick(cfg, st, "missing", "", nil); !errors.Is(err, ErrGroupNotFound) {
+	if _, _, err := Pick(cfg, st, "missing", ""); !errors.Is(err, ErrGroupNotFound) {
 		t.Fatalf("期望 ErrGroupNotFound，实际 %v", err)
 	}
 }
@@ -216,11 +250,11 @@ func TestPickExcludingSkipsTriedMembers(t *testing.T) {
 		},
 	}}
 	st := NewState(nil)
-	first, firstKey, err := Pick(cfg, st, "gpt-5", "", nil)
+	first, firstKey, err := Pick(cfg, st, "gpt-5", "")
 	if err != nil {
 		t.Fatalf("首次选路失败：%v", err)
 	}
-	second, secondKey, err := PickExcluding(cfg, st, "gpt-5", "", map[string]struct{}{firstKey: {}}, nil)
+	second, secondKey, err := PickExcluding(cfg, st, "gpt-5", "", map[string]struct{}{firstKey: {}})
 	if err != nil {
 		t.Fatalf("排除已试成员后应仍有候选：%v", err)
 	}
@@ -246,16 +280,16 @@ func TestPickExcludingAfterCooldownExpires(t *testing.T) {
 	}}
 	now := mustParse(t, "2026-11-06 06:00:00")
 	st := NewState(func() time.Time { return now })
-	_, firstKey, err := Pick(cfg, st, "gpt-5", "", nil)
+	_, firstKey, err := Pick(cfg, st, "gpt-5", "")
 	if err != nil {
 		t.Fatalf("首次选路失败：%v", err)
 	}
 	st.Failure(firstKey, cfg.Routing.Cooldown)
 	now = now.Add(30 * time.Second)
-	if _, _, err := Pick(cfg, st, "gpt-5", "", nil); err != nil {
+	if _, _, err := Pick(cfg, st, "gpt-5", ""); err != nil {
 		t.Fatalf("冷却过期后成员应重新可用：%v", err)
 	}
-	member, _, err := PickExcluding(cfg, st, "gpt-5", "", map[string]struct{}{firstKey: {}}, nil)
+	member, _, err := PickExcluding(cfg, st, "gpt-5", "", map[string]struct{}{firstKey: {}})
 	if err != nil {
 		t.Fatalf("冷却复活不应打断降级链：%v", err)
 	}
@@ -318,7 +352,7 @@ func TestPickDailyWindowCrossDay(t *testing.T) {
 			}}
 			now := mustParse(t, tc.now)
 			st := NewState(func() time.Time { return now })
-			_, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1)))
+			_, _, err := Pick(cfg, st, "gpt-5", "")
 			if tc.want && err != nil {
 				t.Fatalf("时段内应可选中：%v", err)
 			}
@@ -355,7 +389,7 @@ func TestPickDailyWindowSameDay(t *testing.T) {
 			}}
 			now := mustParse(t, tc.now)
 			st := NewState(func() time.Time { return now })
-			_, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1)))
+			_, _, err := Pick(cfg, st, "gpt-5", "")
 			if tc.want && err != nil {
 				t.Fatalf("时段内应可选中：%v", err)
 			}
@@ -390,7 +424,7 @@ func TestPickRequiresBothWindows(t *testing.T) {
 			}}
 			now := mustParse(t, tc.now)
 			st := NewState(func() time.Time { return now })
-			_, _, err := Pick(cfg, st, "gpt-5", "", rand.New(rand.NewSource(1)))
+			_, _, err := Pick(cfg, st, "gpt-5", "")
 			if tc.want && err != nil {
 				t.Fatalf("两个时段都命中应可选中：%v", err)
 			}
