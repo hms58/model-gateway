@@ -24,6 +24,8 @@ func assertNear(t *testing.T, label string, got, want float64) {
 // 一次成功 + 一次成功 + 一次失败：请求数、成功率、token、缓存命中率、平均耗时都要对。
 func TestSnapshotAggregatesTotals(t *testing.T) {
 	recorder := New("")
+	// 固定「现在」：否则数据日期一旦超出近 7 天窗口，这个用例会在真实时间流过后自己失败。
+	recorder.now = func() time.Time { return at(2026, time.November, 6, 12) }
 	now := at(2026, time.November, 6, 10)
 	recorder.Add(now, "workbuddy", "glm-5.3", Delta{
 		Tokens: true, PromptTokens: 1000, CompletionTokens: 200, TotalTokens: 1200,
@@ -170,6 +172,7 @@ func TestSnapshotExplicitWindow(t *testing.T) {
 // 上游字段矛盾（命中数 > prompt）时命中率不能超过 100%。
 func TestCacheHitClamped(t *testing.T) {
 	recorder := New("")
+	recorder.now = func() time.Time { return at(2026, time.November, 6, 12) }
 	recorder.Add(at(2026, time.November, 6, 10), "workbuddy", "glm-5.3", Delta{
 		Tokens: true, PromptTokens: 10, TotalTokens: 10, CacheHitTokens: 99,
 	}, true)
