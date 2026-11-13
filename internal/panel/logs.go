@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"model-gateway/internal/config"
 	"model-gateway/internal/pkg/reqlog"
@@ -23,6 +25,14 @@ const (
 	// 一页最多 100 条，保留 2 万条足够覆盖 200 页以内的翻页；
 	// 更深的页会按实际需要的条数重扫一次（见 logsList）。
 	maxRetainedEntries = 20000
+	// 提示词详情的分片口径：结构接口只回每条消息的预览，正文按 offset/limit 分片拉，
+	// 一次几十万字符的 system 提示词不会把抽屉和浏览器一起卡死。
+	promptPreviewRunes  = 400
+	promptChunkRunes    = 4096
+	promptChunkMaxRunes = 16384
+	// maxRequestIDLen 限制 request_id 入参长度：详情接口只认本网关生成的短 id，
+	// 不做任意长串的目录扫描。
+	maxRequestIDLen = 64
 )
 
 // WithLogs 指定日志目录（为空时查询接口返回空集）。
@@ -130,6 +140,98 @@ func (s *Server) logsOverview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// logPrompt 返回一次请求的提示词详情，分两级：
+//
+//	不带 message 参数：只回结构（每条消息的角色、原文长度、预览片段）；
+//	带 message + offset/limit：只回这条消息的一段正文。
+//
+// 提示词动辄几十万字符，一次全量返回会让抽屉直接卡死，也把详情接口变成大文件下载。
+func (s *Server) logPrompt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, CodeInvalidParam, "方法不支持")
+		return
+	}
+	query := r.URL.Query()
+	requestID := strings.TrimSpace(query.Get("request_id"))
+	if requestID == "" || len(requestID) > maxRequestIDLen {
+		writeError(w, http.StatusBadRequest, CodeInvalidParam, "缺少合法的 request_id")
+		return
+	}
+	prompt, found := reqlog.ReadPromptIn(s.logsDir, promptDayKey(query.Get("date")), requestID)
+	if !found {
+		// 不是 404：旧日志本来就没有提示词快照，前端要能平静地提示「这条没记录」。
+		writeJSON(w, http.StatusOK, map[string]interface{}{"request_id": requestID, "found": false})
+		return
+	}
+	if raw := strings.TrimSpace(query.Get("message")); raw != "" {
+		writePromptChunk(w, prompt, raw, query)
+		return
+	}
+
+	messages := make([]map[string]interface{}, 0, len(prompt.Messages))
+	for index, message := range prompt.Messages {
+		messages = append(messages, map[string]interface{}{
+			"index": index, "role": message.Role, "chars": message.Chars,
+			"stored_chars": utf8.RuneCountInString(message.Content),
+			"truncated":    message.Truncated,
+			"preview":      reqlog.ClipRunes(message.Content, promptPreviewRunes),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"request_id": prompt.RequestID, "found": true, "time": prompt.Time, "group": prompt.Group,
+		"chars": prompt.Chars, "stored_chars": prompt.Stored, "truncated": prompt.Truncated,
+		// omitted 是无文本消息条数（工具调用等），前端汇总到头部，不渲染空块。
+		"omitted":  prompt.Omitted,
+		"messages": messages,
+	})
+}
+
+// writePromptChunk 只回一条消息的一段正文：offset / limit 按字符（rune）计，
+// 客户端拿 next_offset 继续拉，直到 done=true。
+func writePromptChunk(w http.ResponseWriter, prompt reqlog.Prompt, rawIndex string, query url.Values) {
+	index := atoi(rawIndex, -1)
+	if index < 0 || index >= len(prompt.Messages) {
+		writeError(w, http.StatusBadRequest, CodeInvalidParam, "message 越界")
+		return
+	}
+	message := prompt.Messages[index]
+	content := []rune(message.Content)
+	stored := len(content)
+
+	offset := atoi(query.Get("offset"), 0)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > stored {
+		offset = stored
+	}
+	limit := atoi(query.Get("limit"), promptChunkRunes)
+	if limit < 1 {
+		limit = promptChunkRunes
+	}
+	if limit > promptChunkMaxRunes {
+		limit = promptChunkMaxRunes
+	}
+	end := offset + limit
+	if end > stored {
+		end = stored
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"request_id": prompt.RequestID, "index": index, "role": message.Role,
+		"chars": message.Chars, "stored_chars": stored,
+		"offset": offset, "end": end, "next_offset": end,
+		"content": string(content[offset:end]),
+		// done 只表示「这一段读完了」；原文本身没存全要看 truncated。
+		"done": end >= stored, "truncated": message.Truncated,
+	})
+}
+
+// promptDayKey 把面板传的日期（YYYY-MM-DD）转成日志文件名用的 YYYYMMDD。
+// 传空或非法时回落到今天：绝大多数详情点击都发生在当天。
+func promptDayKey(raw string) string {
+	return truncateDay(parseDay(raw, time.Now())).Format("20060102")
+}
+
 // p95 直接对耗时排序取分位；overview 只跑当日数据，成本可控。
 func p95(values []int64) int64 {
 	if len(values) == 0 {
@@ -181,8 +283,15 @@ func (f logFilter) match(entry reqlog.Entry) bool {
 	if f.Token != "" && !strings.Contains(entry.TokenName+entry.TokenID, f.Token) {
 		return false
 	}
-	if f.Keyword != "" && !strings.Contains(entry.Group+entry.Model+entry.TokenName+entry.RequestID, f.Keyword) {
-		return false
+	if f.Keyword != "" {
+		haystack := entry.Group + entry.Model + entry.TokenName + entry.RequestID
+		// 提示词摘要里的片段也参与关键字匹配：日志列表里能直接按「问了什么」搜。
+		if entry.Prompt != nil {
+			haystack += entry.Prompt.Preview
+		}
+		if !strings.Contains(haystack, f.Keyword) {
+			return false
+		}
 	}
 	return true
 }

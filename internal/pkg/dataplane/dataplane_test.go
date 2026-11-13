@@ -69,6 +69,61 @@ func doChat(t *testing.T, handler *Handler, key string) *httptest.ResponseRecord
 	return recorder
 }
 
+// 提示词摘要随请求日志落盘，完整快照另存 prompts-*.jsonl：
+// 列表只有片段，详情接口才能按 request_id 取到全文。
+func TestChatCompletionsRecordsPromptSummaryAndSnapshot(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	member := config.Member{Product: "workbuddy", Model: "gpt-5", Weight: 100, Enabled: true}
+	fx := newFixture(t, upstream.URL, []config.Member{member})
+	dir := t.TempDir()
+	logger := reqlog.New(dir, 7)
+	defer logger.Close()
+	handler := New(fx.store).WithLogger(logger)
+
+	body, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "system", "content": "你是助手"},
+			map[string]interface{}{"role": "user", "content": "帮我改个 bug"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("构造请求体失败：%v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+fx.plain)
+	recorder := httptest.NewRecorder()
+	handler.ChatCompletions(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d：%s", recorder.Code, recorder.Body.String())
+	}
+	logger.Flush()
+
+	recent := logger.Recent(1)
+	if len(recent) != 1 || recent[0].Prompt == nil {
+		t.Fatalf("日志应带提示词摘要：%+v", recent)
+	}
+	summary := recent[0].Prompt
+	// 只记用户提问：system 计入 omitted，不进快照。
+	if summary.Messages != 1 || summary.Omitted != 1 || !summary.Stored || summary.Preview != "帮我改个 bug" {
+		t.Fatalf("摘要不对：%+v", summary)
+	}
+
+	day := strings.ReplaceAll(recent[0].Time[:10], "-", "")
+	prompt, ok := reqlog.ReadPromptIn(dir, day, recent[0].RequestID)
+	if !ok {
+		t.Fatalf("提示词快照应可按 request_id 读到：%s %s", day, recent[0].RequestID)
+	}
+	if len(prompt.Messages) != 1 || prompt.Messages[0].Content != "帮我改个 bug" {
+		t.Fatalf("快照应只保留用户提问：%+v", prompt)
+	}
+}
+
 func TestChatCompletionsForwardsAndRewritesModel(t *testing.T) {
 	var sawModel, sawAuth string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

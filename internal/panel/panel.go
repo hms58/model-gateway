@@ -85,6 +85,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/modelgw/tokens/", s.auth(http.HandlerFunc(s.tokenItem)))
 	mux.Handle("/api/modelgw/logs", s.auth(http.HandlerFunc(s.logsList)))
 	mux.Handle("/api/modelgw/logs/overview", s.auth(http.HandlerFunc(s.logsOverview)))
+	// 提示词详情单独一个接口：列表只带摘要，完整正文按 request_id 分片取。
+	mux.Handle("/api/modelgw/logs/prompt", s.auth(http.HandlerFunc(s.logPrompt)))
 	mux.Handle("/api/modelgw/usage", s.auth(http.HandlerFunc(s.usageSnapshot)))
 	mux.Handle("/api/modelgw/config/rollback", s.auth(http.HandlerFunc(s.rollback)))
 	mux.Handle("/api/modelgw/config/version", s.auth(http.HandlerFunc(s.version)))

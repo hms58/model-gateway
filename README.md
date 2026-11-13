@@ -165,7 +165,7 @@ export MODELGW_ADMIN_TOKEN='your-strong-token'
 | --- | --- |
 | `state.json` | 冷却 / 熔断 / Token 计数 / 产品健康，5s 合并落盘 |
 | `models.json` | 各产品模型列表缓存（10 分钟内直接读文件） |
-| `logs/` | 按天 `requests-YYYYMMDD.jsonl`，保留期到期自动清理 |
+| `logs/` | 按天 `requests-YYYYMMDD.jsonl`（请求日志）与 `prompts-YYYYMMDD.jsonl`（提示词快照），保留期到期一起清理 |
 | `usage.json` | 请求与 token 用量累计：小时桶保留 90 天后折叠为日桶（永久），面板「统计」页的数据源；**不受日志保留期影响** |
 
 ### 接三家上游：最小可用配置
@@ -332,6 +332,82 @@ resp = client.chat.completions.create(
 curl ... -H "X-Session-Id: my-conversation-42"
 ```
 
+### 提示词记录（只留本次用户原始输入）
+
+`messages` 是整段对话历史：每轮请求都会把之前所有 `user` / `assistant` / `tool` 再发一遍，
+所以一次请求里会有**多条 `user`**（历史提问）。日志只回答「这次用户问了什么」，只取**最后一条 `user` 消息**；
+其余消息（含历史提问、`system`、`assistant`、`tool`）只计入 `omitted`，响应体本来就不记。
+
+客户端常在 `user` 消息里注入 `<additional_data>` 等上下文，并用 `<user_query>` 包住真正输入：
+有这对标签时**只取标签内的文本**；普通 OpenAI 客户端没有标签，整条保留。
+
+数据分两处存，避免一次响应变成大文件下载：
+
+| 落点 | 内容 | 读法 |
+| --- | --- | --- |
+| `requests-YYYYMMDD.jsonl` 的 `prompt` 字段 | 摘要：本次输入字符数、预览片段（前 200 字符）、`omitted` 历史消息数 | `GET /api/modelgw/logs` 直接带出，列表只渲染这一小段 |
+| `prompts-YYYYMMDD.jsonl` | 本次输入快照（单条 `user`），**最多记 16K 字符**，超出部分只记长度 | `GET /api/modelgw/logs/prompt?request_id=...` |
+
+口径与边界：
+
+- 只记文本：`content` 是数组时只拼 `text` 分段，`image_url` / `input_audio` 等分段记成 `[类型]` 占位，**`data:base64` 原文不会进日志**。
+- 历史提问与调用链都不落盘，`omitted` 只记录条数；详情里永远只有 1 个块。
+- 单条输入超过 16K 时截前 16K 字符并标 `truncated`。
+- 提示词与请求日志同受 `logging.retention_days` 约束，过期一起删；两者都按 `max_file_mb` 滚动。
+
+详情接口两级返回，正文再分片：
+
+```bash
+# 第一级：结构。单条输入只给原文长度 / 已存长度 / 预览，不含正文
+curl -H "Authorization: Bearer <口令>" \
+  "http://127.0.0.1:8080/api/modelgw/logs/prompt?request_id=<id>&date=2026-11-09"
+```
+
+```json
+{
+  "request_id": "9f3c1e2a7b4d5608",
+  "found": true,
+  "time": "2026-11-09 10:00:00",
+  "group": "glm-5.3",
+  "chars": 244,
+  "stored_chars": 244,
+  "truncated": false,
+  "omitted": 231,
+  "messages": [
+    { "index": 0, "role": "user", "chars": 244, "stored_chars": 244, "truncated": false, "preview": "只保留提示词相关…" }
+  ]
+}
+```
+
+```bash
+# 第二级：输入的正文分片。offset / limit 按字符（rune）计，默认 4096、上限 16384
+curl -H "Authorization: Bearer <口令>" \
+  "http://127.0.0.1:8080/api/modelgw/logs/prompt?request_id=<id>&date=2026-11-09&message=0&offset=0&limit=4096"
+```
+
+```json
+{
+  "request_id": "9f3c1e2a7b4d5608",
+  "index": 0,
+  "role": "user",
+  "chars": 244,
+  "stored_chars": 244,
+  "offset": 0,
+  "end": 244,
+  "next_offset": 244,
+  "content": "只保留提示词相关…",
+  "done": true,
+  "truncated": false
+}
+```
+
+`done=true` 表示这一段已读完；`truncated=true` 表示原文本身超过记录上限，后面部分没有落盘。
+`found=false` 是正常结果（旧日志、已过保留期、或这次请求没有用户提问），不是错误。
+`date` 传日志里那条记录的日期（`YYYY-MM-DD`），缺省按今天找。
+
+> 提示词里可能含业务数据与密钥，日志目录不要放进同步盘或提交到仓库。
+> 不需要这项能力时把 `logging.dir` 指到临时目录并缩短 `retention_days`。
+
 ## 管理面板
 
 浏览器打开 `http://127.0.0.1:8080/panel/`，输入管理口令（只存在本机 localStorage）。
@@ -342,7 +418,7 @@ curl ... -H "X-Session-Id: my-conversation-42"
 | `/panel/products` | 产品增删改、连通性测试、key 掩码展示；填了 `console_url` 的产品，点产品名可在新标签页打开它自己的后台 |
 | `/panel/groups` | 模型组成员、权重上下移、成员状态与手动嗅探 |
 | `/panel/models` | 各产品模型清单（可强制回源刷新）；**停用的产品不列出**，单个模型可停用/启用（被模型组使用的不能停用；停用状态按「产品 + 模型名」保存，刷新目录后仍保留） |
-| `/panel/logs` | 请求日志查询（按结果 / 产品 / 状态码 / 关键字），分页默认 100 条/页（上限 100），可选 50/100，支持 5s 自动刷新（只存浏览器） |
+| `/panel/logs` | 请求日志查询（按结果 / 产品 / 状态码 / 关键字，关键字也会匹配提示词预览），分页默认 100 条/页（上限 100），可选 50/100，支持 5s 自动刷新（只存浏览器）；**提示词列只放片段，点「详情」看结构、按消息分片加载全文** |
 | `/panel/usage` | 统计：请求次数、成功率、平均耗时、token 用量与缓存命中率；按天趋势（默认近 7 天）+ 按「产品 + 模型」的 token Top。**不含积分维度** |
 | `/panel/tokens` | 虚拟 Token 创建、启停、组授权 |
 | `/panel/settings` | 启动参数（监听 / 数据目录 / 管理口令）+ 选路、熔断、探活、日志 |

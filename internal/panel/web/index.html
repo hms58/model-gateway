@@ -187,14 +187,14 @@
     .id { font-family: var(--mono); font-size: 12.5px; }
     .num { font-variant-numeric: tabular-nums; }
 
-    /* 列多的表（请求日志 13 列）给每列留足宽度：容器不够就横向滚动，
+    /* 列多的表（请求日志 14 列）给每列留足宽度：容器不够就横向滚动，
        而不是把 width:100% 硬压成竖排折字。 */
     /* 不要再设 min-width：nowrap 后表格的 min-content 宽度就是真实下限，
        写死 1080px 会在 1366 屏上凭空多出一条滚动条。
        容器够宽时 width:100% 铺满；不够时由 .table-wrap 横向滚动。 */
     table.wide > thead > tr > th,
     table.wide > tbody > tr > td { white-space: nowrap; }
-    /* 13 列挤在一起时横向内边距最费空间：收到 7px，1280 屏留足余量不滚。 */
+    /* 14 列挤在一起时横向内边距最费空间：收到 7px，1280 屏留足余量不滚。 */
     table.wide > thead > tr > th,
     table.wide > tbody > tr > td { padding-left: 7px; padding-right: 7px; }
     /* 允许换行的列（来源里的 UA / 请求 ID）用 wrap，但要给上下限，避免撑爆整张表。 */
@@ -520,6 +520,26 @@
       box-shadow: var(--shadow);
     }
     .drawer h3 { font-size: 16px; margin-bottom: 14px; }
+    /* 提示词抽屉宽一点、正文等宽可换行：长 system 提示词与代码块也能读，不撑出横向滚动条。 */
+    #drawer.prompt-wide .body { width: min(860px, 100%); }
+    .prompt-block { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 10px; }
+    .prompt-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 6px; font-size: 12px; }
+    .prompt-body {
+      margin: 0 0 8px;
+      max-height: 320px;
+      overflow: auto;
+      padding: 10px;
+      background: #f7f9fb;
+      border-radius: var(--radius-sm);
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    /* 列表里的提示词片段：整列只留一行，详情按钮跟在片段后面。 */
+    .prompt-peek { display: inline-flex; align-items: center; gap: 6px; max-width: 220px; }
+    .prompt-peek .peek { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
     .row > label { flex: 1 1 170px; display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
     /* 开关型 label：横向排布，否则复选框和文字会被竖排样式拆成两行 */
@@ -812,9 +832,9 @@
           </div>
           <div class="pager" id="log-pager" hidden></div>
           <div class="table-wrap">
-            <!-- wide：13 列需要固定可读宽度，窄屏改为容器内横向滚动，而不是压缩折行 -->
+            <!-- wide：14 列需要固定可读宽度，窄屏改为容器内横向滚动，而不是压缩折行 -->
             <table class="wide">
-              <thead><tr><th></th><th>时间</th><th>Token</th><th>来源</th><th>模型组</th><th>命中成员</th><th>状态</th><th>结果</th><th>耗时</th><th>输入/输出</th><th>缓存命中</th><th>积分</th><th>尝试链路</th></tr></thead>
+              <thead><tr><th></th><th>时间</th><th>Token</th><th>来源</th><th>模型组</th><th>提示词</th><th>命中成员</th><th>状态</th><th>结果</th><th>耗时</th><th>输入/输出</th><th>缓存命中</th><th>积分</th><th>尝试链路</th></tr></thead>
               <tbody id="logs-body"></tbody>
             </table>
           </div>
@@ -1127,6 +1147,24 @@
         return (index ? '<span class="arrow">›</span>' : '') +
           chip(who + ' <b>' + esc(a.status || '×') + '</b>', cls, (a.code || '') + ' ' + fmtMs(a.ms));
       }).join('') + '</span>';
+    }
+    // 提示词列：只显示摘要里的预览片段（几十字），全文走详情抽屉按消息分片拉。
+    // 旧日志没有摘要、或摘要没落盘时不出「详情」按钮，避免点了没反应。
+    function promptText(entry) {
+      const prompt = entry.prompt;
+      if (!prompt || !prompt.messages) return '<span class="muted">-</span>';
+      const text = String(prompt.preview || '');
+      const chars = Array.from(text);
+      const peek = text
+        ? '<span class="peek" title="' + esc(text) + '">' + esc(chars.length > 36 ? chars.slice(0, 36).join('') + '…' : text) + '</span>'
+        : '<span class="muted">（无文本）</span>';
+      const open = prompt.stored && entry.request_id
+        ? '<button type="button" data-act="log-prompt" data-id="' + esc(entry.request_id) +
+          '" data-date="' + esc((entry.time || '').slice(0, 10)) + '">详情</button>'
+        : '';
+      const hint = '本次用户输入 · ' + Number(prompt.chars || 0) + ' 字符' +
+        (prompt.truncated ? ' · 已截断' : '');
+      return '<span class="prompt-peek" title="' + esc(hint) + '">' + peek + open + '</span>';
     }
 
     // ---------- 产品 ----------
@@ -2005,6 +2043,7 @@
         cell('Token', esc(entry.token_name || entry.token_id || '-')) +
         cell('来源', sourceText(entry), 'wrap') +
         cell('模型组', '<span class="id">' + esc(entry.group) + '</span>') +
+        cell('提示词', promptText(entry)) +
         cell('命中成员', '<span class="mono">' + esc((entry.product || '-') + '/' + (entry.model || '-')) + '</span>') +
         cell('状态', '<span class="num">' + esc(entry.http_status || 0) + '</span>') +
         cell('结果', chip(esc(entry.outcome || '-'), outcomeClass(entry.outcome))) +
@@ -2014,7 +2053,7 @@
         cell('缓存命中', cacheText(entry)) +
         cell('积分', creditText(entry)) +
         cell('尝试链路', attemptChain(entry.attempts)) +
-        '</tr>').join('') || '<tr class="card"><td colspan="13"><div class="empty"><b>这个范围内没有请求</b>换个时间范围，或先跑一次 /v1/chat/completions。</div></td></tr>';
+        '</tr>').join('') || '<tr class="card"><td colspan="14"><div class="empty"><b>这个范围内没有请求</b>换个时间范围，或先跑一次 /v1/chat/completions。</div></td></tr>';
       const total = payload.total || 0;
       const downgraded = rows.filter(item => (item.attempts || []).length > 1).length;
       document.getElementById('log-summary').textContent = '共 ' + total + ' 条' + (rows.length ? '（本页降级 ' + downgraded + ' 条）' : '');
@@ -2042,6 +2081,108 @@
         logPage = 1;
         loadLogs().catch(err => toast(err.message));
       };
+    }
+
+    // 提示词详情：先取结构（每条提问只回预览），点「展开全文」再按 offset 分片拉正文。
+    // 一次点击只搬几千字符，长提问也不会把抽屉卡死。
+    let promptRef = { id: '', date: '' };
+
+    function promptQuery(extra) {
+      const query = new URLSearchParams({ request_id: promptRef.id });
+      if (promptRef.date) query.set('date', promptRef.date);
+      if (extra) Object.keys(extra).forEach(key => query.set(key, String(extra[key])));
+      return query.toString();
+    }
+
+    async function openLogPrompt(requestId, date) {
+      promptRef = { id: requestId, date: date || '' };
+      const payload = await api('/logs/prompt?' + promptQuery());
+      if (!payload.found) {
+        toast('这条请求没有提示词快照：旧日志未记录，或已过日志保留期');
+        return;
+      }
+      document.getElementById('drawer').classList.add('prompt-wide');
+      showDrawer(promptDrawer(payload), null);
+      const close = document.getElementById('prompt-close');
+      if (close) close.onclick = closeDrawer;
+      document.querySelectorAll('[data-act="prompt-more"]').forEach(button => {
+        button.onclick = () => loadPromptChunk(button);
+      });
+    }
+
+    // 客户端把用户原始输入包在 <user_query> 里，前面还带 <additional_data> 注入。
+    // 新快照服务端已提取过；旧快照没提取，这里在展示时补一道，避免又看到注入块。
+    function rawUserQuery(text) {
+      const open = '<user_query>', close = '</user_query>';
+      const start = text.indexOf(open);
+      if (start < 0) return text;
+      const from = start + open.length;
+      const end = text.indexOf(close, from);
+      const inner = (end < 0 ? text.slice(from) : text.slice(from, end)).trim();
+      return inner || text;
+    }
+
+    function promptDrawer(payload) {
+      const all = payload.messages || [];
+      // 只显示最后一条 user（本次原始输入）：旧快照里还混着历史提问与调用链，一并收起。
+      // 一个字符都没记下来的块也不渲染，条数汇总到头部。
+      const users = all.filter(item =>
+        String(item.role || '').toLowerCase() === 'user' && Number(item.stored_chars) > 0);
+      const messages = users.length ? [users[users.length - 1]] : [];
+      const skipped = all.length - messages.length + Number(payload.omitted || 0);
+      const total = Number(payload.chars || 0);
+      const stored = Number(payload.stored_chars || 0);
+      const head = '<h3>用户原始输入</h3>' +
+        '<p class="muted">' + esc(payload.time || '-') + ' · ' + esc(payload.group || '-') +
+        '<br>' + (messages.length ? '本次输入' : '没有可显示的输入') + ' · 原文 ' + total + ' 字符' +
+        (payload.truncated ? ' · 超过记录上限，只存了前 ' + stored + ' 字符' : '') +
+        (skipped ? ' · 另有 ' + skipped + ' 条历史消息未记录（含历史提问与调用链）' : '') + '</p>';
+      const blocks = messages.map(item => {
+        const chars = Number(item.chars || 0);
+        const kept = Number(item.stored_chars || 0);
+        const preview = rawUserQuery(String(item.preview || ''));
+        // 服务端按 rune 计数，这里也要按码点比：emoji 之类用 length 会多算。
+        const previewChars = Array.from(preview).length;
+        const more = kept > previewChars
+          ? '<button type="button" data-act="prompt-more" data-index="' + item.index +
+            '" data-offset="0">展开全文（' + kept + ' 字符）</button>'
+          : '';
+        return '<div class="prompt-block">' +
+          '<div class="prompt-head"><b>' + esc(item.role || '-') + '</b>' +
+          '<span class="muted">' + chars + ' 字符' + (kept < chars ? '（只记录前 ' + kept + '）' : '') + '</span></div>' +
+          '<pre class="prompt-body" id="prompt-body-' + item.index + '">' + esc(preview) +
+          (kept > previewChars ? '…' : '') + '</pre>' + more + '</div>';
+      }).join('');
+      return head + (blocks || '<div class="empty">这次请求没有可读的消息内容。</div>') +
+        '<div class="sticky-save"><button type="button" id="prompt-close">关闭</button></div>';
+    }
+
+    async function loadPromptChunk(button) {
+      const index = button.dataset.index;
+      const offset = Number(button.dataset.offset) || 0;
+      const box = document.getElementById('prompt-body-' + index);
+      if (!box) return;
+      button.disabled = true;
+      try {
+        const payload = await api('/logs/prompt?' +
+          promptQuery({ message: index, offset: offset, limit: 4000 }));
+        // 累计原文留在 dataset 里，展示时统一提取 <user_query>：
+        // 分片追加不会把已经剥掉的注入块又拼回来。
+        const raw = (offset ? (box.dataset.raw || '') : '') + (payload.content || '');
+        box.dataset.raw = raw;
+        box.textContent = rawUserQuery(raw);
+        button.dataset.offset = String(payload.next_offset || 0);
+        if (payload.done) {
+          button.hidden = true;
+          if (payload.truncated) toast('原文超过记录上限，后面部分没有落盘');
+        } else {
+          button.disabled = false;
+          button.textContent = '继续加载（还有 ' + Math.max(0, Number(payload.stored_chars || 0) - Number(payload.next_offset || 0)) + ' 字符）';
+        }
+      } catch (err) {
+        button.disabled = false;
+        toast(err.message);
+      }
     }
 
     // ---------- 统计 ----------
@@ -2478,7 +2619,12 @@
       const cancel = body.querySelector('#f-cancel, #t-cancel, #tg-cancel');
       if (cancel) cancel.onclick = closeDrawer;
     }
-    function closeDrawer() { document.getElementById('drawer').classList.remove('show'); drawerSave = null; }
+    function closeDrawer() {
+      const node = document.getElementById('drawer');
+      node.classList.remove('show');
+      node.classList.remove('prompt-wide');
+      drawerSave = null;
+    }
     // 点遮罩关闭必须是「按下和松开都在遮罩上」：在输入框里拖选文字时，
     // 一不小心把鼠标划到遮罩上松手，浏览器会把 click 派发到公共祖先 #drawer，
     // event.target 正好是遮罩，抽屉就被关掉、选中的内容也丢了。
@@ -2521,6 +2667,7 @@
         .then(p => toast(p.ok ? ('连通正常：' + p.count + ' 个模型，' + p.latency_ms + 'ms') : ('连通失败：' + p.error + '（' + p.latency_ms + 'ms）')))
         .catch(e => toast(e.message));
       if (act === 'select-group') return openGroup(target.dataset.name);
+      if (act === 'log-prompt') return openLogPrompt(target.dataset.id, target.dataset.date).catch(e => toast(e.message));
       if (act === 'member-up') return moveMember(Number(target.dataset.index), 'up');
       if (act === 'member-down') return moveMember(Number(target.dataset.index), 'down');
       if (act === 'member-remove') return removeMember(Number(target.dataset.index));
@@ -2561,7 +2708,7 @@
       products: ['产品', '下游 *2api 实例在这里登记，模型组按产品挑成员。'],
       groups: ['模型组', '组名即对外模型名；权重越大越优先，同权重按列表顺序。'],
       models: ['模型', '各产品可用的模型清单，落盘缓存，过期或缺文件才回源。'],
-      logs: ['请求日志', '每次请求命中了谁、降级了几次、首包多慢。'],
+      logs: ['请求日志', '每次请求命中了谁、降级了几次、首包多慢；提示词列只放片段，点详情按消息分片看全文。'],
       usage: ['统计', '只统计 token 用量、请求次数、成功率与耗时；Top 按产品 + 模型汇总。'],
       tokens: ['Token', '对外分发的虚拟 key，只存哈希与前缀。'],
       settings: ['配置', '选路、熔断、探活与日志这些通用参数。'],

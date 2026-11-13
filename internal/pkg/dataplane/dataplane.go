@@ -185,7 +185,10 @@ func (h *Handler) relay(w http.ResponseWriter, r *http.Request, req relayRequest
 	defer releaseProbes()
 	defer func() {
 		h.noteUsage(req.record.ID, state.product, state.outcome)
+		// 时间在日志里显式赋值：提示词快照要用同一个时间戳，
+		// 否则两处各取一次 now 会出现「同一次请求两条记录时间不一致」。
 		entry := reqlog.Entry{
+			Time:      time.Now().In(config.Location()).Format(config.TimeLayout),
 			RequestID: requestID(), ClientRequestID: clientRequestID(r),
 			ClientIP: clientIP(r), UA: r.UserAgent(),
 			TokenID: req.record.ID, TokenName: req.record.Name,
@@ -204,6 +207,16 @@ func (h *Handler) relay(w http.ResponseWriter, r *http.Request, req relayRequest
 		if len(state.attempts) > 0 {
 			last := state.attempts[len(state.attempts)-1]
 			entry.Product, entry.Model = last.Product, last.Model
+		}
+		// 提示词：日志里只放摘要（列表一次 100 条，不能每条都带上百 KB 原文），
+		// 完整快照另存 prompts-*.jsonl，由面板详情接口按 request_id 分片读取。
+		// 没接日志器时直接跳过解析：多一次整包 Unmarshal 对转发路径没有价值。
+		if h.logger != nil {
+			if prompt, summary, ok := reqlog.CaptureChatPrompt(req.body, reqlog.PromptLimitChars); ok {
+				prompt.RequestID, prompt.Time, prompt.Group = entry.RequestID, entry.Time, req.groupName
+				summary.Stored = h.writePrompt(prompt)
+				entry.Prompt = &summary
+			}
 		}
 		h.writeLog(entry)
 		h.recordUsage(entry, state.usage, state.outcome == proxy.OutcomeOK)
@@ -392,6 +405,15 @@ func (h *Handler) writeLog(entry reqlog.Entry) {
 		return
 	}
 	h.logger.Write(entry)
+}
+
+// writePrompt 落一条提示词快照；返回 false 表示没写成功（没接日志器或队列满），
+// 调用方据此把摘要里的 stored 置为 false，面板就不会给出一个点不开的「详情」。
+func (h *Handler) writePrompt(prompt reqlog.Prompt) bool {
+	if h.logger == nil {
+		return false
+	}
+	return h.logger.WritePrompt(prompt)
 }
 
 // recordUsage 把一次请求计入用量累计器（面板「统计」页的数据源）。
